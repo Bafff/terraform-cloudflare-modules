@@ -1,0 +1,9 @@
+.terraform/
+.terraform.lock.hcl
+*.tfstate*
+*.tfplan*
+credentials.json
+age-key.txt
+*.sops.*
+.ci-tools/
+__pycache__/

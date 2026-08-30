@@ -1,0 +1,20 @@
+# Terraform Cloudflare Modules
+
+Reusable Terraform modules for generic Cloudflare configurations.
+
+Planned modules:
+
+- `dns-zone`
+- `access-application`
+- `workers-service`
+- `r2-bucket`
+
+Examples and documentation use only `example.com` domains and all-zero
+sentinel identifiers. CI supports macOS ARM64 and Linux AMD64. Native Windows
+support is explicitly deferred.
+
+Run the repository checks with:
+
+```sh
+make check
+```
