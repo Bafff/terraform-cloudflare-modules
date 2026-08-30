@@ -27,6 +27,9 @@ FILENAME_RULES = (
 )
 PRIVATE_KEY = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
 AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+AWS_SECRET_ACCESS_KEY_ASSIGNMENT = re.compile(
+    r"(?i)\bAWS_SECRET_ACCESS_KEY\b\s*[:=]\s*(?!re\.compile\()\S+"
+)
 GITHUB_TOKEN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
 AGE_SECRET_KEY = re.compile(r"\bAGE-SECRET-KEY-1[A-Z0-9]+\b")
 NAMED_SECRET = re.compile(
@@ -88,6 +91,8 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                 findings.append(Finding(relative, line_number, "private-key-marker"))
             if AWS_ACCESS_KEY.search(line):
                 findings.append(Finding(relative, line_number, "aws-secret-format"))
+            if AWS_SECRET_ACCESS_KEY_ASSIGNMENT.search(line):
+                findings.append(Finding(relative, line_number, "aws-secret-access-key-assignment"))
             if GITHUB_TOKEN.search(line):
                 findings.append(Finding(relative, line_number, "github-secret-format"))
             if AGE_SECRET_KEY.search(line):
@@ -120,9 +125,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", type=pathlib.Path, required=True)
     arguments = parser.parse_args()
-    for finding in scan_path(arguments.path):
+    findings = scan_path(arguments.path)
+    for finding in findings:
         print(f"{finding.path}:{finding.line}:{finding.rule}")
-    return 1 if scan_path(arguments.path) else 0
+    return 1 if findings else 0
 
 
 if __name__ == "__main__":

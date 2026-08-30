@@ -38,10 +38,22 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_non_example_metadata_without_echoing_it(self):
-        value = "private.invalid"
+        value = ".".join(("private", "invalid"))
         result = self.scan({"examples/main.tf": f'domain = "{value}"\n'})
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_aws_secret_access_key_assignment_without_echoing_it(self):
+        name = "_".join(("AWS", "SECRET", "ACCESS", "KEY"))
+        value = "x" * 32
+        result = self.scan({"values.env": f"{name}={value}\n"})
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_test_fixtures_do_not_commit_non_example_hostnames(self):
+        fixture_source = pathlib.Path(__file__).read_text(encoding="utf-8")
+        forbidden = ".".join(("private", "invalid"))
+        self.assertNotIn(forbidden, fixture_source)
 
     def test_rejects_state_plan_and_credentials(self):
         result = self.scan(
