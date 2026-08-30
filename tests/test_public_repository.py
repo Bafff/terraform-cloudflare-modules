@@ -175,6 +175,23 @@ class SetupCiToolsTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(install_dir.exists())
 
+    def test_rejects_unlocked_lock_before_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            lock = self.create_lock(root, "file:///does/not/matter", "0" * 64)
+            lock_data = json.loads(lock.read_text(encoding="utf-8"))
+            del lock_data["tools"]["terraform"]["archives"]["linux_amd64"]["url"]
+            lock.write_text(json.dumps(lock_data), encoding="utf-8")
+            install_dir = root / "bin"
+            result = subprocess.run(
+                ["bash", INSTALLER, "--lock-file", lock, "--install-dir", install_dir],
+                env={"PATH": "/usr/bin:/bin", "SETUP_CI_TOOLS_PLATFORM": "linux_amd64"},
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(install_dir.exists())
+
     def test_rejects_unknown_platform_without_downloading(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
