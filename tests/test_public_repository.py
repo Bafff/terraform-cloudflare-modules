@@ -115,7 +115,10 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(remote.stdout, "")
         self.assertEqual((ROOT / ".terraform-version").read_text(encoding="utf-8").strip(), "1.16.0")
-        self.assertIn("example.com", (ROOT / "README.md").read_text(encoding="utf-8"))
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("example.com", readme)
+        self.assertIn("macOS ARM64 is for local operator work; Linux AMD64 is for CI.", readme)
+        self.assertIn("Native Windows support is explicitly deferred.", readme)
 
 
 class SetupCiToolsTest(unittest.TestCase):

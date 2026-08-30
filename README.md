@@ -10,8 +10,8 @@ Planned modules:
 - `r2-bucket`
 
 Examples and documentation use only `example.com` domains and all-zero
-sentinel identifiers. CI supports macOS ARM64 and Linux AMD64. Native Windows
-support is explicitly deferred.
+sentinel identifiers. macOS ARM64 is for local operator work; Linux AMD64 is for CI.
+Native Windows support is explicitly deferred.
 
 Run the repository checks with:
 
