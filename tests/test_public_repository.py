@@ -235,6 +235,104 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_accepts_multiline_hcl_expression_in_heredoc(self):
+        result = self.scan(
+            {
+                "examples/main.tf": (
+                    "value = <<EOT\n"
+                    "${jsonencode(\n"
+                    "local.settings\n"
+                    ")}\n"
+                    "EOT\n"
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_nested_template_expression_traversals(self):
+        for path, content in {
+            "examples/quoted.tf": 'value = "${format("${local.settings}")}"\n',
+            "modules/example/heredoc.tf": (
+                "value = <<EOT\n"
+                '${format("${local.settings}")}\n'
+                "EOT\n"
+            ),
+        }.items():
+            with self.subTest(path=path):
+                result = self.scan({path: content})
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_hostname_in_heredoc_opened_inside_template_expression(self):
+        value = ".".join(("private", "invalid"))
+        for path in ("examples/main.tf", "modules/example/main.tf"):
+            with self.subTest(path=path):
+                result = self.scan(
+                    {
+                        path: (
+                            'value = "prefix-${jsonencode(<<EOT\n'
+                            f"{value}\n"
+                            "EOT\n"
+                            ')}"\n'
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_hostname_in_nested_expression_heredocs(self):
+        value = ".".join(("private", "invalid"))
+        inner_heredocs = {
+            "ordinary": f"<<INNER\n{value}\nINNER",
+            "indented": f"<<-INNER\n  {value}\n  INNER",
+        }
+        for path in ("examples/main.tf", "modules/example/main.tf"):
+            for style, inner_heredoc in inner_heredocs.items():
+                with self.subTest(path=path, style=style):
+                    result = self.scan(
+                        {
+                            path: (
+                                "value = <<OUTER\n"
+                                f"${{jsonencode({inner_heredoc}\n)}}\n"
+                                "OUTER\n"
+                            )
+                        }
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_hcl_metadata_context_matrix_covers_examples_and_modules(self):
+        value = ".".join(("private", "invalid"))
+        contexts = {
+            "string": f'value = "{value}"\n',
+            "line-comment": f"# {value}\n",
+            "block-comment": f"/* {value} */\n",
+            "heredoc": f"value = <<EOT\n{value}\nEOT\n",
+            "expression-string": f'value = "${{lower("{value}")}}"\n',
+            "expression-comment": f'value = "${{lower(/* {value} */ "EXAMPLE.COM")}}"\n',
+        }
+        for root in ("examples", "modules/example"):
+            for context, content in contexts.items():
+                with self.subTest(root=root, context=context):
+                    result = self.scan({f"{root}/main.tf": content})
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_module_hcl(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan(
+            {"modules/example/main.tf": f'domain = "{value}"\n'}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_sentinel_cloudflare_id_in_module_hcl(self):
+        value = "1" * 32
+        result = self.scan(
+            {"modules/example/main.tf": f'account_id = "{value}"\n'}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
     def test_rejects_non_example_hostname_in_hcl_comment(self):
         value = ".".join(("private", "invalid"))
         result = self.scan({"examples/main.tf": f"# {value}\n"})
@@ -365,6 +463,191 @@ class PublicRepositoryTest(unittest.TestCase):
             {"scripts/patterns.py": 'GITHUB_TOKEN = re.compile("pattern")\n'}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_named_secret_hcl_references_and_null(self):
+        assignments = (
+            (("cloudflare", "api", "token"), "var.token"),
+            (("github", "token"), "null"),
+            (("github", "api", "key"), "local.api_key"),
+            (("aws", "secret"), "data.sops_file.secrets.data"),
+            (("github", "token"), "token"),
+            (("cloudflare", "token"), "sensitive(var.token)"),
+            (("aws", "api", "key"), "try(local.api_key, null)"),
+            (("github", "secret"), "[for value in var.values : value]"),
+            (("cloudflare", "secret"), '"${var.token}"'),
+        )
+        body = "".join(
+            f"  {'_'.join(name_parts)} = {value}\n"
+            for name_parts, value in assignments
+        )
+        result = self.scan(
+            {
+                "modules/example/main.tf": f"locals {{\n{body}}}\n"
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_dynamic_named_secret_after_url_string(self):
+        name = "_".join(("github", "token"))
+        result = self.scan(
+            {
+                "modules/example/main.tf": (
+                    'value = { url = "https://example.com", '
+                    f"{name} = var.token }}\n"
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_literal_named_secret_assignment(self):
+        name = "_".join(("cloudflare", "api", "token"))
+        value = "literal-" + ("x" * 24)
+        result = self.scan(
+            {"modules/example/main.tf": f'{name} = "{value}"\n'}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_static_hcl_named_secret_forms(self):
+        name = "_".join(("cloudflare", "token"))
+        github_name = "_".join(("github", "token"))
+        aws_name = "_".join(("AWS", "SECRET", "ACCESS", "KEY"))
+        value = "literal-" + ("x" * 24)
+        cases = {
+            "named-heredoc.tf": f"{name} = <<EOT\n{value}\nEOT\n",
+            "aws-heredoc.tf": f"{aws_name} = <<EOT\n{value}\nEOT\n",
+            "wrapped-heredoc.tf": f"{name} = sensitive(<<EOT\n{value}\nEOT\n)\n",
+            "multiline-wrapped-heredoc.tf": f"{name} = sensitive(\n<<EOT\n{value}\nEOT\n)\n",
+            "escaped-template.tf": f'{name} = "$${{literal-placeholder}}"\n',
+            "comment-after-literal.tf": f'{name} = "{value}" # ${{token}}\n',
+            "commented-assignment.tf": f'# {name} = "{value}"\n',
+            "commented-bare-assignment.tf": f"# {name} = token\n",
+            "commented-aws-assignment.tf": f"# {aws_name} = token\n",
+            "inline-comment-before-equals.tf": f'{name} /* note */ = "{value}"\n',
+            "multiline-comment-before-equals.tf": f'{name} /*\nnote\n*/ = "{value}"\n',
+            "nested-comment-before-equals.tf": f'{name} /* outer /* nested */ note */ = "{value}"\n',
+            "inline-object-heredoc.tf": f"value = {{ {name} = sensitive(<<EOT\n{value}\nEOT\n) }}\n",
+            "mixed-template.tf": f'{name} = "${{var.prefix}}{value}"\n',
+            "wrapped-literal.tf": f'{name} = sensitive("{value}")\n',
+            "wrapped-mixed-template.tf": f'{name} = sensitive("${{var.prefix}}{value}")\n',
+            "comment-after-equals.tf": f'{name} = /* note */ "{value}"\n',
+            "multiline-comment-after-equals.tf": f'{name} = /*\nnote\n*/ "{value}"\n',
+            "nested-comment-after-equals.tf": f'{name} = /* outer /* nested */ note */ "{value}"\n',
+            "line-comment-after-equals.tf": f'{name} = # note\n"{value}"\n',
+            "comment-before-inline-key.tf": f'value = {{ /* note */ {name} = "{value}" }}\n',
+            "prefixed-comment.tf": f'# TODO: {name} = var.token\n',
+            "nested-block-comment.tf": f'/* outer /* nested */ {name} = var.token */\n',
+            "multiple-inline-assignments.tf": f'value = {{ {name} = var.token, {github_name} = "{value}" }}\n',
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan({f"modules/example/{filename}": content})
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_prefixed_non_hcl_secret_assignments(self):
+        aws_name = "_".join(("AWS", "SECRET", "ACCESS", "KEY"))
+        value = "literal-" + ("x" * 24)
+        for filename, content in {
+            "environment.sh": f"export {aws_name}={value}\n",
+            "values.yaml": f"- {aws_name}: {value}\n",
+        }.items():
+            with self.subTest(filename=filename):
+                result = self.scan({filename: content})
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_static_named_secret_in_terraform_json(self):
+        name = "_".join(("cloudflare", "token"))
+        value = "literal-" + ("x" * 24)
+        for label, secret_value in {
+            "static": value,
+            "mixed-template": "${var.prefix}" + value,
+        }.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {"modules/example/main.tf.json": json.dumps({name: secret_value})}
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_static_collection_under_terraform_json_secret_key(self):
+        name = "_".join(("github", "token"))
+        value = "literal-" + ("x" * 24)
+        for label, secret_value in {
+            "list": [value],
+            "object": {"value": value},
+        }.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf.json": json.dumps(
+                            {name: secret_value}
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_accepts_dynamic_and_null_terraform_json_secret_values(self):
+        first_name = "_".join(("github", "token"))
+        second_name = "_".join(("cloudflare", "token"))
+        result = self.scan(
+            {
+                "modules/example/main.tf.json": json.dumps(
+                    {
+                        first_name: "${var.token}",
+                        second_name: None,
+                    }
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_named_secret_in_malformed_json(self):
+        name = "_".join(("github", "token"))
+        value = "literal-" + ("x" * 24)
+        result = self.scan(
+            {"config.json": f'{{"{name}": "{value}",}}\n'}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_static_duplicate_named_secret_in_json(self):
+        name = "_".join(("github", "token"))
+        value = "literal-" + ("x" * 24)
+        for label, static_value in {
+            "string": f'"{value}"',
+            "number": "12345",
+            "boolean": "true",
+        }.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {
+                        "config.json": (
+                            f'{{"{name}": {static_value}, '
+                            f'"{name}": "${{var.token}}"}}\n'
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_named_secret_assignment_inside_hcl_heredoc(self):
+        name = "_".join(("github", "token"))
+        value = "literal_value"
+        result = self.scan(
+            {
+                "modules/example/main.tf": (
+                    "value = <<EOT\n"
+                    f"{name} = {value}\n"
+                    "EOT\n"
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("named-secret-format", result.stdout)
+        self.assertNotIn(value, result.stdout + result.stderr)
 
     def test_remote_is_absent_or_the_expected_public_repository(self):
         remotes = subprocess.run(

@@ -51,7 +51,7 @@ variable "mail" {
 
   validation {
     condition     = length(var.mail.mx) > 0 && alltrue([for key in keys(var.mail.mx) : can(regex("^mail-mx-[a-z0-9]+(?:-[a-z0-9]+)*$", key))])
-    error_message = "mail.mx must contain at least one entry keyed by a stable mail-mx-* slug."
+    error_message = "The mail object must contain at least one MX entry keyed by a stable mail-mx-* slug."
   }
 
   validation {
