@@ -33,6 +33,13 @@ class HclExpressionFrame:
     expecting_object_key: bool = False
 
 
+@dataclasses.dataclass(frozen=True)
+class HclHeredocMatch:
+    terminator: str
+    allows_indent: bool
+    end: int
+
+
 @dataclasses.dataclass
 class HclHostnameState:
     block_comment_depth: int = 0
@@ -77,8 +84,8 @@ ASSET_PATH_EXTENSION = re.compile(
 CLOUDFLARE_ID = re.compile(r"\b[0-9a-fA-F]{32}\b")
 PROVIDER_BLOCK = re.compile(r"\bprovider\s+\"")
 BACKEND_BLOCK = re.compile(r"\bbackend\s+\"")
-HCL_HEREDOC = re.compile(
-    r"<<(?P<allows_indent>-?)\s*(?P<terminator>[A-Za-z_][A-Za-z0-9_]*)"
+HCL_NUMBER_LITERAL = re.compile(
+    r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
 )
 
 
@@ -177,7 +184,25 @@ def _hcl_template_contains_static_literal(value: str) -> bool:
             index = end
             continue
         return True
-    return not saw_dynamic
+    return bool(value) and not saw_dynamic
+
+
+def _iter_hcl_template_expression_spans(value: str):
+    index = 0
+    while index < len(value):
+        if value.startswith(("$${", "%%{"), index):
+            index += 3
+        elif value.startswith(("${", "%{"), index):
+            expression_start = index + 2
+            end, _ = _scan_hcl_template_expression(
+                value, expression_start
+            )
+            if end <= expression_start or value[end - 1 : end] != "}":
+                return
+            yield expression_start, end - 1
+            index = end
+        else:
+            index += 1
 
 
 def _scan_hcl_quoted_string(value: str, start: int) -> tuple[bool, int]:
@@ -186,7 +211,6 @@ def _scan_hcl_quoted_string(value: str, start: int) -> tuple[bool, int]:
         end = value.find("'", start + 1)
         return True, len(value) if end == -1 else end + 1
 
-    has_dynamic_segment = False
     has_literal_segment = False
     index = start + 1
     while index < len(value):
@@ -197,19 +221,104 @@ def _scan_hcl_quoted_string(value: str, start: int) -> tuple[bool, int]:
             has_literal_segment = True
             index += 3
         elif value.startswith(("${", "%{"), index):
-            has_dynamic_segment = True
-            index, nested_literal = _scan_hcl_template_expression(
-                value, index + 2
+            expression_start = index + 2
+            index, _ = _scan_hcl_template_expression(value, expression_start)
+            nested_literal = (
+                index <= expression_start
+                or value[index - 1 : index] != "}"
+                or _hcl_expression_exposes_literal(
+                    value[expression_start : index - 1], 0
+                )
             )
             has_literal_segment = has_literal_segment or nested_literal
         elif value[index] == '"':
-            return (
-                has_literal_segment or not has_dynamic_segment,
-                index + 1,
-            )
+            return has_literal_segment, index + 1
         else:
             has_literal_segment = True
             index += 1
+    return True, len(value)
+
+
+def _decode_hcl_quoted_escape(value: str, start: int) -> tuple[str, int]:
+    simple_escapes = {
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        '"': '"',
+        "\\": "\\",
+    }
+    if start + 1 >= len(value):
+        return "\\", start + 1
+
+    escape = value[start + 1]
+    if escape in simple_escapes:
+        return simple_escapes[escape], start + 2
+
+    digit_count = {"u": 4, "U": 8}.get(escape)
+    if digit_count is not None:
+        end = start + 2 + digit_count
+        digits = value[start + 2 : end]
+        if len(digits) == digit_count and re.fullmatch(
+            rf"[0-9A-Fa-f]{{{digit_count}}}", digits
+        ):
+            codepoint = int(digits, 16)
+            if codepoint <= 0x10FFFF and not 0xD800 <= codepoint <= 0xDFFF:
+                return chr(codepoint), end
+
+    return value[start : start + 2], start + 2
+
+
+def _decode_hcl_quoted_candidate(
+    text: str, quote_start: int
+) -> tuple[str, int] | None:
+    decoded: list[str] = []
+    index = quote_start + 1
+    while index < len(text):
+        if text.startswith(("${", "%{"), index):
+            return None
+        if text[index] == "\\":
+            character, index = _decode_hcl_quoted_escape(text, index)
+            decoded.append(character)
+        elif text.startswith("$${", index):
+            decoded.append("${")
+            index += 3
+        elif text.startswith("%%{", index):
+            decoded.append("%{")
+            index += 3
+        elif text[index] == '"':
+            return "".join(decoded), index + 1
+        else:
+            decoded.append(text[index])
+            index += 1
+    return None
+
+
+def _scan_hcl_heredoc_literal(
+    value: str, start: int, match: HclHeredocMatch
+) -> tuple[bool, int]:
+    opener_end = value.find("\n", match.end)
+    if opener_end == -1:
+        return True, len(value)
+
+    terminator = match.terminator
+    allows_indent = match.allows_indent
+    body_start = opener_end + 1
+    line_start = body_start
+    while line_start <= len(value):
+        line_end = value.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(value)
+        line = value[line_start:line_end].removesuffix("\r")
+        is_terminator = (
+            line.lstrip(" \t") == terminator
+            if allows_indent
+            else line == terminator
+        )
+        if is_terminator:
+            return line_start > body_start, line_end
+        if line_end == len(value):
+            break
+        line_start = line_end + 1
     return True, len(value)
 
 
@@ -239,8 +348,11 @@ def _scan_hcl_template_expression(
         elif value[index] in {'"', "'"}:
             nested_literal, index = _scan_hcl_quoted_string(value, index)
             found_literal = found_literal or nested_literal
-        elif HCL_HEREDOC.match(value, index):
-            return len(value), True
+        elif heredoc_match := _match_hcl_heredoc(value, index):
+            exposes_literal, index = _scan_hcl_heredoc_literal(
+                value, index, heredoc_match
+            )
+            found_literal = found_literal or exposes_literal
         elif value[index] == "{":
             depth += 1
             index += 1
@@ -270,7 +382,18 @@ def _hcl_position_is_in_comment_or_string(text: str, position: int) -> bool:
                 heredoc_stack.pop()
                 continue
             if is_current_line:
-                return True
+                _, _, current_line_comment = _hcl_hostname_source(
+                    line, heredoc_state
+                )
+                return bool(
+                    current_line_comment
+                    or heredoc_state.expression_comment_depth
+                    or heredoc_state.expression_string
+                    or (
+                        heredoc_state.in_heredoc
+                        and heredoc_state.expression_depth == 0
+                    )
+                )
             _, opened_heredoc, current_line_comment = (
                 _hcl_hostname_source(line, heredoc_state)
             )
@@ -295,6 +418,9 @@ def _hcl_position_is_in_comment_or_string(text: str, position: int) -> bool:
 def _hcl_expression_exposes_literal(text: str, start: int) -> bool:
     frames: list[HclExpressionFrame] = []
     block_comment_depth = 0
+    conditional_predicate_positions = _hcl_conditional_predicate_map(
+        text[start:]
+    )
     saw_value = False
     index = start
     while index < len(text):
@@ -326,8 +452,13 @@ def _hcl_expression_exposes_literal(text: str, start: int) -> bool:
                 next_position=next_line,
             )
             index = next_line
-        elif heredoc_match := HCL_HEREDOC.match(text, index):
-            return True
+        elif heredoc_match := _match_hcl_heredoc(text, index):
+            exposes_literal, index = _scan_hcl_heredoc_literal(
+                text, index, heredoc_match
+            )
+            if exposes_literal:
+                return True
+            saw_value = True
         elif text[index] in {'"', "'"}:
             exposes_literal, string_end = _scan_hcl_quoted_string(
                 text, index
@@ -335,15 +466,41 @@ def _hcl_expression_exposes_literal(text: str, start: int) -> bool:
             if (
                 exposes_literal
                 and not _hcl_string_is_selector(frames)
-                and not _hcl_string_is_object_key(
-                    text, string_end, frames
+                and (
+                    not _hcl_string_is_object_key(
+                        text, string_end, frames
+                    )
+                    or _hcl_object_key_can_flow_to_value(frames)
                 )
             ):
                 return True
             index = string_end
             saw_value = True
+        elif scalar_end := _hcl_scalar_literal_end(text, index):
+            if (
+                not _hcl_scalar_is_control_position(
+                    index,
+                    frames,
+                    conditional_predicate_positions,
+                    position_offset=start,
+                )
+                and not (
+                    _hcl_token_is_object_key(
+                        text, scalar_end, frames
+                    )
+                    and not _hcl_object_key_can_flow_to_value(frames)
+                )
+            ):
+                return True
+            index = scalar_end
+            saw_value = True
         elif text[index] in "([{":
-            selector_context = _hcl_string_is_selector(frames)
+            selector_context = _hcl_scalar_is_selector(frames) or (
+                text[index] == "("
+                and bool(frames)
+                and frames[-1].opener == "{"
+                and frames[-1].expecting_object_key
+            )
             function_name = (
                 _hcl_function_name_before(text, index)
                 if text[index] == "("
@@ -406,15 +563,189 @@ def _hcl_expression_exposes_literal(text: str, start: int) -> bool:
     return False
 
 
+def _hcl_scalar_literal_end(text: str, start: int) -> int | None:
+    if start > 0:
+        previous = text[start - 1]
+        if previous.isalnum() or previous in "_.":
+            return None
+        if (
+            previous == "-"
+            and start > 1
+            and (text[start - 2].isalnum() or text[start - 2] in "_-")
+        ):
+            return None
+
+    for value in ("true", "false"):
+        if text.startswith(value, start):
+            end = start + len(value)
+            if end == len(text) or not (
+                text[end].isalnum() or text[end] in "_-"
+            ):
+                return end
+
+    match = HCL_NUMBER_LITERAL.match(text, start)
+    if match is None:
+        return None
+    end = match.end()
+    if end < len(text) and (text[end].isalnum() or text[end] == "_"):
+        return None
+    return end
+
+
+def _hcl_scalar_is_control_position(
+    start: int,
+    frames: list[HclExpressionFrame],
+    conditional_predicate_positions: bytearray,
+    *,
+    position_offset: int,
+) -> bool:
+    return bool(
+        _hcl_scalar_is_selector(frames)
+        or conditional_predicate_positions[start - position_offset]
+    )
+
+
+def _hcl_conditional_predicate_map(text: str) -> bytearray:
+    interval_events = [0] * (len(text) + 1)
+    openers: list[str] = []
+    segment_starts = [0]
+    pending_conditionals = [0]
+    for_expressions = [False]
+    for_filter_starts: list[int | None] = [None]
+    block_comment_depth = 0
+    index = 0
+    while index < len(text):
+        if block_comment_depth:
+            if text.startswith("/*", index):
+                block_comment_depth += 1
+                index += 2
+            elif text.startswith("*/", index):
+                block_comment_depth -= 1
+                index += 2
+            else:
+                index += 1
+        elif text.startswith("/*", index):
+            block_comment_depth = 1
+            index += 2
+        elif text.startswith("//", index) or text[index] == "#":
+            newline = text.find("\n", index)
+            index = len(text) if newline == -1 else newline + 1
+        elif text[index] in {'"', "'"}:
+            _, index = _scan_hcl_quoted_string(text, index)
+        elif heredoc_match := _match_hcl_heredoc(text, index):
+            _, index = _scan_hcl_heredoc_literal(
+                text, index, heredoc_match
+            )
+        elif text[index] in "([{":
+            openers.append(text[index])
+            segment_starts.append(index + 1)
+            pending_conditionals.append(0)
+            for_expressions.append(False)
+            for_filter_starts.append(None)
+            index += 1
+        elif text[index] in ")]}":
+            if openers:
+                if for_filter_starts[-1] is not None:
+                    interval_events[for_filter_starts[-1]] += 1
+                    interval_events[index] -= 1
+                openers.pop()
+                segment_starts.pop()
+                pending_conditionals.pop()
+                for_expressions.pop()
+                for_filter_starts.pop()
+            index += 1
+        elif text[index] == "_" or text[index].isidentifier():
+            identifier_start = index
+            index += 1
+            while index < len(text) and (
+                text[index] == "-"
+                or ("a" + text[index]).isidentifier()
+            ):
+                index += 1
+            identifier = text[identifier_start:index]
+            if openers and openers[-1] in "[{":
+                if identifier == "for":
+                    for_expressions[-1] = True
+                elif identifier == "if" and for_expressions[-1]:
+                    for_filter_starts[-1] = index
+        elif text[index] == "?":
+            interval_events[segment_starts[-1]] += 1
+            interval_events[index] -= 1
+            pending_conditionals[-1] += 1
+            segment_starts[-1] = index + 1
+            index += 1
+        elif text[index] == ":":
+            if pending_conditionals[-1]:
+                pending_conditionals[-1] -= 1
+            segment_starts[-1] = index + 1
+            index += 1
+        elif text[index] == ",":
+            segment_starts[-1] = index + 1
+            index += 1
+        elif (
+            text[index] == "="
+            and openers
+            and openers[-1] == "{"
+            and not text.startswith(("==", "=>"), index)
+        ):
+            segment_starts[-1] = index + 1
+            index += 1
+        elif (
+            text[index] == "\n"
+            and not _hcl_expression_continues_at(text, index + 1)
+        ):
+            segment_starts[-1] = index + 1
+            index += 1
+        else:
+            index += 1
+
+    positions = bytearray(len(text))
+    active_intervals = 0
+    for position in range(len(text)):
+        active_intervals += interval_events[position]
+        positions[position] = active_intervals > 0
+    return positions
+
+
 def _hcl_function_name_before(text: str, position: int) -> str | None:
     significant = _hcl_previous_significant_position(text, position)
     if significant is None:
         return None
     index = significant
     end = index + 1
-    while index >= 0 and (text[index].isalnum() or text[index] == "_"):
+    while index >= 0 and (
+        text[index].isalnum() or text[index] in "_-:"
+    ):
         index -= 1
     return text[index + 1 : end] or None
+
+
+def _match_hcl_heredoc(
+    text: str, start: int
+) -> HclHeredocMatch | None:
+    if not text.startswith("<<", start):
+        return None
+    index = start + 2
+    allows_indent = index < len(text) and text[index] == "-"
+    if allows_indent:
+        index += 1
+    if index >= len(text) or not (
+        text[index] == "_" or text[index].isidentifier()
+    ):
+        return None
+    terminator_start = index
+    index += 1
+    while index < len(text) and (
+        text[index] == "-" or ("a" + text[index]).isidentifier()
+    ):
+        index += 1
+    if index < len(text) and text[index] not in "\r\n":
+        return None
+    return HclHeredocMatch(
+        terminator=text[terminator_start:index],
+        allows_indent=allows_indent,
+        end=index,
+    )
 
 
 def _hcl_maybe_start_next_object_entry(
@@ -550,8 +881,40 @@ def _hcl_string_is_selector(
     )
 
 
+def _hcl_scalar_is_selector(
+    frames: list[HclExpressionFrame],
+) -> bool:
+    if _hcl_string_is_selector(frames):
+        return True
+    if not frames:
+        return False
+    frame = frames[-1]
+    control_arguments = {
+        "element": {1},
+        "slice": {1, 2},
+        "substr": {1, 2},
+    }
+    return bool(
+        frame.function_name in control_arguments
+        and frame.argument_index
+        in control_arguments[frame.function_name]
+    )
+
+
 def _hcl_string_is_object_key(
     text: str, string_end: int, frames: list[HclExpressionFrame]
+) -> bool:
+    return _hcl_token_is_object_key(text, string_end, frames)
+
+
+def _hcl_object_key_can_flow_to_value(
+    frames: list[HclExpressionFrame],
+) -> bool:
+    return any(frame.function_name == "keys" for frame in frames[:-1])
+
+
+def _hcl_token_is_object_key(
+    text: str, token_end: int, frames: list[HclExpressionFrame]
 ) -> bool:
     if (
         not frames
@@ -559,11 +922,167 @@ def _hcl_string_is_object_key(
         or not frames[-1].expecting_object_key
     ):
         return False
-    index = _hcl_next_significant_position(text, string_end)
+    index = _hcl_next_significant_position(text, token_end)
     return index is not None and (
         text[index] == ":"
         or (text[index] == "=" and not text.startswith("==", index))
     )
+
+
+def _iter_decoded_hcl_quoted_assignments(
+    text: str,
+    structural_quote_starts: frozenset[int] | None = None,
+):
+    if structural_quote_starts is None:
+        structural_quote_starts = _hcl_structural_quote_starts(text)
+    for quote_start in sorted(structural_quote_starts):
+        candidate = _decode_hcl_quoted_candidate(text, quote_start)
+        if candidate is None:
+            continue
+        decoded_name, string_end = candidate
+        if not (
+            AWS_SECRET_ACCESS_KEY_NAME.fullmatch(decoded_name)
+            or NAMED_SECRET_NAME.fullmatch(decoded_name)
+        ):
+            continue
+        operator = _hcl_quoted_key_operator(
+            text, quote_start, string_end
+        )
+        if (
+            decoded_name is not None
+            and operator is not None
+        ):
+            value_start = _hcl_next_significant_position(text, operator + 1)
+            if value_start is not None:
+                yield (
+                    decoded_name,
+                    value_start,
+                    _hcl_object_value_end(text, value_start),
+                    text.count("\n", 0, quote_start) + 1,
+                )
+
+
+def _hcl_static_secret_assignment_rules(text: str) -> tuple[str, ...]:
+    rules: set[str] = set()
+    structural_quote_starts = _hcl_structural_quote_starts(text)
+    for assignment_pattern, assignment_rule in (
+        (
+            AWS_SECRET_ACCESS_KEY_ASSIGNMENT,
+            "aws-secret-access-key-assignment",
+        ),
+        (NAMED_SECRET_ASSIGNMENT, "named-secret-format"),
+    ):
+        for assignment_match in assignment_pattern.finditer(text):
+            if (
+                text[assignment_match.start()] in {'"', "'"}
+                and assignment_match.start() in structural_quote_starts
+            ):
+                continue
+            value_start = _assignment_value_start(text, assignment_match)
+            if value_start is None:
+                continue
+            if _hcl_position_is_in_comment_or_string(
+                text, assignment_match.start()
+            ) or _hcl_expression_exposes_literal(text, value_start):
+                rules.add(assignment_rule)
+
+    for decoded_name, value_start, value_end, _ in (
+        _iter_decoded_hcl_quoted_assignments(
+            text, structural_quote_starts
+        )
+    ):
+        if AWS_SECRET_ACCESS_KEY_NAME.fullmatch(decoded_name):
+            assignment_rule = "aws-secret-access-key-assignment"
+        elif NAMED_SECRET_NAME.fullmatch(decoded_name):
+            assignment_rule = "named-secret-format"
+        else:
+            continue
+        if _hcl_expression_exposes_literal(
+            text[value_start:value_end], 0
+        ):
+            rules.add(assignment_rule)
+    return tuple(sorted(rules))
+
+
+def _hcl_quoted_key_operator(
+    text: str, quote_start: int, string_end: int
+) -> int | None:
+    operator = _hcl_next_significant_position(text, string_end)
+    context_start = quote_start
+    while (
+        operator is not None
+        and operator < len(text)
+        and text[operator] == ")"
+    ):
+        opening = _hcl_previous_significant_position(text, context_start)
+        if opening is None or text[opening] != "(":
+            return None
+        before_opening = _hcl_previous_significant_character(text, opening)
+        if before_opening is not None and (
+            before_opening.isalnum() or before_opening in "_.)]}"
+        ):
+            return None
+        context_start = opening
+        operator = _hcl_next_significant_position(text, operator + 1)
+
+    if (
+        operator is None
+        or operator >= len(text)
+        or text[operator] not in "=:"
+        or text.startswith("==", operator)
+    ):
+        return None
+    previous = _hcl_previous_significant_character(text, context_start)
+    if text[operator] == ":" and previous == "?":
+        return None
+    return operator
+
+
+def _hcl_object_value_end(text: str, start: int) -> int:
+    frames: list[str] = []
+    block_comment_depth = 0
+    index = start
+    while index < len(text):
+        if block_comment_depth > 0:
+            if text.startswith("/*", index):
+                block_comment_depth += 1
+                index += 2
+            elif text.startswith("*/", index):
+                block_comment_depth -= 1
+                index += 2
+            else:
+                index += 1
+        elif text.startswith("/*", index):
+            block_comment_depth = 1
+            index += 2
+        elif text.startswith("//", index) or text[index] == "#":
+            newline = text.find("\n", index)
+            if not frames:
+                return len(text) if newline == -1 else newline
+            index = len(text) if newline == -1 else newline + 1
+        elif text[index] in {'"', "'"}:
+            _, index = _scan_hcl_quoted_string(text, index)
+        elif heredoc_match := _match_hcl_heredoc(text, index):
+            _, index = _scan_hcl_heredoc_literal(
+                text, index, heredoc_match
+            )
+        elif text[index] in "([{":
+            frames.append(text[index])
+            index += 1
+        elif text[index] in ")]}":
+            if not frames:
+                return index
+            frames.pop()
+            index += 1
+        elif text[index] == "," and not frames:
+            return index
+        elif text[index] == "\n" and not frames:
+            if not _hcl_expression_continues_at(text, index + 1):
+                return index
+            index += 1
+        else:
+            index += 1
+    return len(text)
 
 
 def _json_contains_static_named_secret(value: object) -> bool:
@@ -621,15 +1140,38 @@ def _decoded_json_source(
     if not is_expression or not _is_hcl_path(path):
         return decoded
     state = HclHostnameState(in_heredoc=True)
-    sources = [
-        _hcl_hostname_source(line, state)[0]
-        for line in decoded.splitlines()
-    ]
+    heredoc_stack: list[tuple[str, bool, HclHostnameState]] = []
+    sources: list[str] = []
+    for line in decoded.splitlines():
+        if heredoc_stack:
+            terminator, allows_indent, heredoc_state = heredoc_stack[-1]
+            is_terminator = (
+                line.lstrip(" \t") == terminator
+                if allows_indent
+                else line == terminator
+            )
+            if is_terminator:
+                heredoc_stack.pop()
+                sources.append("")
+                continue
+            source, opened_heredoc, _ = _hcl_hostname_source(
+                line, heredoc_state
+            )
+        else:
+            source, opened_heredoc, _ = _hcl_hostname_source(line, state)
+        sources.append(source)
+        if opened_heredoc is not None:
+            heredoc_stack.append(
+                (*opened_heredoc, HclHostnameState(in_heredoc=True))
+            )
     return " ".join(sources)
 
 
 def _hcl_hostname_source(
-    line: str, state: HclHostnameState
+    line: str,
+    state: HclHostnameState,
+    structural_quote_starts: list[int] | None = None,
+    line_offset: int = 0,
 ) -> tuple[str, tuple[str, bool] | None, bool]:
     literal: list[str] = []
     heredoc = None
@@ -664,8 +1206,8 @@ def _hcl_hostname_source(
                 index += 1
         elif state.expression_string:
             if line[index] == "\\" and index + 1 < len(line):
-                literal.append(line[index : index + 2])
-                index += 2
+                decoded, index = _decode_hcl_quoted_escape(line, index)
+                literal.append(decoded)
             elif line.startswith("$${", index):
                 literal.append("${")
                 index += 3
@@ -699,13 +1241,15 @@ def _hcl_hostname_source(
                 literal.append(line[index + 1 :])
                 line_comment = True
                 break
-            elif heredoc_match := HCL_HEREDOC.match(line, index):
+            elif heredoc_match := _match_hcl_heredoc(line, index):
                 heredoc = (
-                    heredoc_match.group("terminator"),
-                    heredoc_match.group("allows_indent") == "-",
+                    heredoc_match.terminator,
+                    heredoc_match.allows_indent,
                 )
-                index = heredoc_match.end()
+                index = heredoc_match.end
             elif line[index] == '"':
+                if structural_quote_starts is not None:
+                    structural_quote_starts.append(line_offset + index)
                 state.expression_string = True
                 index += 1
             elif line[index] == "{":
@@ -743,8 +1287,8 @@ def _hcl_hostname_source(
                 index += 1
         elif state.in_string:
             if line[index] == "\\" and index + 1 < len(line):
-                literal.append(line[index : index + 2])
-                index += 2
+                decoded, index = _decode_hcl_quoted_escape(line, index)
+                literal.append(decoded)
             elif line.startswith("$${", index):
                 literal.append("${")
                 index += 3
@@ -774,17 +1318,58 @@ def _hcl_hostname_source(
             line_comment = True
             break
         elif line[index] == '"':
+            if structural_quote_starts is not None:
+                structural_quote_starts.append(line_offset + index)
             state.in_string = True
             index += 1
-        elif heredoc_match := HCL_HEREDOC.match(line, index):
+        elif heredoc_match := _match_hcl_heredoc(line, index):
             heredoc = (
-                heredoc_match.group("terminator"),
-                heredoc_match.group("allows_indent") == "-",
+                heredoc_match.terminator,
+                heredoc_match.allows_indent,
             )
-            index = heredoc_match.end()
+            index = heredoc_match.end
         else:
             index += 1
     return "".join(literal), heredoc, line_comment
+
+
+def _hcl_structural_quote_starts(text: str) -> frozenset[int]:
+    quote_starts: list[int] = []
+    state = HclHostnameState()
+    heredoc_stack: list[tuple[str, bool, HclHostnameState]] = []
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        if heredoc_stack:
+            terminator, allows_indent, heredoc_state = heredoc_stack[-1]
+            is_terminator = (
+                line.lstrip(" \t") == terminator
+                if allows_indent
+                else line == terminator
+            )
+            if is_terminator:
+                heredoc_stack.pop()
+                offset += len(raw_line)
+                continue
+            _, opened_heredoc, _ = _hcl_hostname_source(
+                line,
+                heredoc_state,
+                quote_starts,
+                offset,
+            )
+        else:
+            _, opened_heredoc, _ = _hcl_hostname_source(
+                line,
+                state,
+                quote_starts,
+                offset,
+            )
+        if opened_heredoc is not None:
+            heredoc_stack.append(
+                (*opened_heredoc, HclHostnameState(in_heredoc=True))
+            )
+        offset += len(raw_line)
+    return frozenset(quote_starts)
 
 
 def _iter_regular_files(root: pathlib.Path):
@@ -840,7 +1425,43 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                         json_value
                     )
                 )
+                if _is_hcl_path(path):
+                    for decoded, is_expression in _iter_json_strings(
+                        json_value
+                    ):
+                        if not is_expression:
+                            continue
+                        for expression_start, expression_end in (
+                            _iter_hcl_template_expression_spans(decoded)
+                        ):
+                            expression = decoded[
+                                expression_start:expression_end
+                            ]
+                            for assignment_rule in (
+                                _hcl_static_secret_assignment_rules(
+                                    expression
+                                )
+                            ):
+                                findings.append(
+                                    Finding(relative, 0, assignment_rule)
+                                )
                 for decoded_source in decoded_json_sources:
+                    for assignment_pattern, assignment_rule in (
+                        (
+                            AWS_SECRET_ACCESS_KEY_ASSIGNMENT,
+                            "aws-secret-access-key-assignment",
+                        ),
+                        (NAMED_SECRET_ASSIGNMENT, "named-secret-format"),
+                    ):
+                        for assignment_match in assignment_pattern.finditer(
+                            decoded_source
+                        ):
+                            if _assignment_value_start(
+                                decoded_source, assignment_match
+                            ) is not None:
+                                findings.append(
+                                    Finding(relative, 0, assignment_rule)
+                                )
                     for pattern, rule in (
                         (PRIVATE_KEY, "private-key-marker"),
                         (AWS_ACCESS_KEY, "aws-secret-format"),
@@ -858,6 +1479,11 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                                     "non-public-email-domain",
                                 )
                             )
+        structural_quote_starts = (
+            _hcl_structural_quote_starts(text)
+            if _is_hcl_path(path) and not json_was_parsed
+            else frozenset()
+        )
         if path.suffix != ".json" or not json_was_parsed:
             for assignment_pattern, assignment_rule in (
                 (
@@ -867,6 +1493,13 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                 (NAMED_SECRET_ASSIGNMENT, "named-secret-format"),
             ):
                 for assignment_match in assignment_pattern.finditer(text):
+                    if (
+                        _is_hcl_path(path)
+                        and text[assignment_match.start()] in {'"', "'"}
+                        and assignment_match.start()
+                        in structural_quote_starts
+                    ):
+                        continue
                     value_start = _assignment_value_start(
                         text, assignment_match
                     )
@@ -880,6 +1513,33 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                     ):
                         findings.append(
                             Finding(relative, assignment_line, assignment_rule)
+                        )
+            if _is_hcl_path(path):
+                for (
+                    decoded_name,
+                    value_start,
+                    value_end,
+                    assignment_line,
+                ) in _iter_decoded_hcl_quoted_assignments(
+                    text, structural_quote_starts
+                ):
+                    if AWS_SECRET_ACCESS_KEY_NAME.fullmatch(decoded_name):
+                        assignment_rule = (
+                            "aws-secret-access-key-assignment"
+                        )
+                    elif NAMED_SECRET_NAME.fullmatch(decoded_name):
+                        assignment_rule = "named-secret-format"
+                    else:
+                        continue
+                    if _hcl_expression_exposes_literal(
+                        text[value_start:value_end], 0
+                    ):
+                        findings.append(
+                            Finding(
+                                relative,
+                                assignment_line,
+                                assignment_rule,
+                            )
                         )
         in_example = pathlib.PurePosixPath(relative).parts[:1] == ("examples",)
         in_module = pathlib.PurePosixPath(relative).parts[:1] == ("modules",)
@@ -908,68 +1568,31 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                         )
         heredoc_stack: list[tuple[str, bool, HclHostnameState]] = []
         hcl_hostname_state = HclHostnameState()
+        is_hcl = _is_hcl_path(path)
         for line_number, line in enumerate(text.splitlines(), start=1):
             if json_was_parsed:
                 continue
-            if PRIVATE_KEY.search(line):
-                findings.append(
-                    Finding(relative, line_number, "private-key-marker")
-                )
-            if AWS_ACCESS_KEY.search(line):
-                findings.append(
-                    Finding(relative, line_number, "aws-secret-format")
-                )
-            if GITHUB_TOKEN.search(line):
-                findings.append(
-                    Finding(relative, line_number, "github-secret-format")
-                )
-            if AGE_SECRET_KEY.search(line):
-                findings.append(
-                    Finding(relative, line_number, "age-secret-format")
-                )
-
-            for match in EMAIL.finditer(line):
-                if not _is_permitted_domain(match.group(1)):
-                    findings.append(Finding(relative, line_number, "non-public-email-domain"))
-
-            if in_metadata_scope:
-                without_emails = EMAIL.sub("", line)
-                hostname_source = without_emails
-                if _is_hcl_path(path):
-                    if heredoc_stack:
-                        terminator, allows_indent, heredoc_hostname_state = (
-                            heredoc_stack[-1]
-                        )
-                        is_terminator = (
-                            line.lstrip(" \t") == terminator
-                            if allows_indent
-                            else line == terminator
-                        )
-                        if is_terminator:
-                            heredoc_stack.pop()
-                            hostname_source = ""
-                        else:
-                            (
-                                hostname_source,
-                                opened_heredoc,
-                                _,
-                            ) = _hcl_hostname_source(
-                                without_emails, heredoc_hostname_state
-                            )
-                            if opened_heredoc is not None:
-                                heredoc_stack.append(
-                                    (
-                                        *opened_heredoc,
-                                        HclHostnameState(in_heredoc=True),
-                                    )
-                                )
+            hcl_literal_source = line
+            if is_hcl:
+                if heredoc_stack:
+                    terminator, allows_indent, heredoc_hostname_state = (
+                        heredoc_stack[-1]
+                    )
+                    is_terminator = (
+                        line.lstrip(" \t") == terminator
+                        if allows_indent
+                        else line == terminator
+                    )
+                    if is_terminator:
+                        heredoc_stack.pop()
+                        hcl_literal_source = ""
                     else:
                         (
-                            hostname_source,
+                            hcl_literal_source,
                             opened_heredoc,
                             _,
                         ) = _hcl_hostname_source(
-                            without_emails, hcl_hostname_state
+                            line, heredoc_hostname_state
                         )
                         if opened_heredoc is not None:
                             heredoc_stack.append(
@@ -978,15 +1601,82 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                                     HclHostnameState(in_heredoc=True),
                                 )
                             )
+                else:
+                    (
+                        hcl_literal_source,
+                        opened_heredoc,
+                        _,
+                    ) = _hcl_hostname_source(line, hcl_hostname_state)
+                    if opened_heredoc is not None:
+                        heredoc_stack.append(
+                            (
+                                *opened_heredoc,
+                                HclHostnameState(in_heredoc=True),
+                            )
+                        )
+
+            scan_sources = (line, hcl_literal_source) if is_hcl else (line,)
+            for scan_source in scan_sources:
+                for pattern, rule in (
+                    (PRIVATE_KEY, "private-key-marker"),
+                    (AWS_ACCESS_KEY, "aws-secret-format"),
+                    (GITHUB_TOKEN, "github-secret-format"),
+                    (AGE_SECRET_KEY, "age-secret-format"),
+                ):
+                    if pattern.search(scan_source):
+                        findings.append(Finding(relative, line_number, rule))
+
+                for match in EMAIL.finditer(scan_source):
+                    if not _is_permitted_domain(match.group(1)):
+                        findings.append(
+                            Finding(
+                                relative,
+                                line_number,
+                                "non-public-email-domain",
+                            )
+                        )
+
+            if is_hcl:
+                for assignment_pattern, assignment_rule in (
+                    (
+                        AWS_SECRET_ACCESS_KEY_ASSIGNMENT,
+                        "aws-secret-access-key-assignment",
+                    ),
+                    (NAMED_SECRET_ASSIGNMENT, "named-secret-format"),
+                ):
+                    for assignment_match in assignment_pattern.finditer(
+                        hcl_literal_source
+                    ):
+                        if _assignment_value_start(
+                            hcl_literal_source, assignment_match
+                        ) is not None:
+                            findings.append(
+                                Finding(
+                                    relative,
+                                    line_number,
+                                    assignment_rule,
+                                )
+                            )
+
+            if in_metadata_scope:
+                metadata_source = hcl_literal_source if is_hcl else line
+                hostname_source = EMAIL.sub("", metadata_source)
                 hostname_source = ASSET_PATH_EXTENSION.sub(
                     r"/\1", hostname_source
                 )
                 for match in HOSTNAME.finditer(hostname_source):
                     if not _is_permitted_domain(match.group(0)):
                         findings.append(Finding(relative, line_number, "non-example-hostname"))
-                for match in CLOUDFLARE_ID.finditer(line):
-                    if set(match.group(0)) != {"0"}:
-                        findings.append(Finding(relative, line_number, "non-sentinel-cloudflare-id"))
+                for id_source in (line, metadata_source):
+                    for match in CLOUDFLARE_ID.finditer(id_source):
+                        if set(match.group(0)) != {"0"}:
+                            findings.append(
+                                Finding(
+                                    relative,
+                                    line_number,
+                                    "non-sentinel-cloudflare-id",
+                                )
+                            )
 
             if in_module and PROVIDER_BLOCK.search(line):
                 findings.append(Finding(relative, line_number, "module-provider-configuration"))

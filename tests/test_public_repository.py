@@ -6,6 +6,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.parse
 import zipfile
@@ -378,6 +379,9 @@ class PublicRepositoryTest(unittest.TestCase):
             "modules/example/tests/id.tftest.hcl": (
                 f'id = "{cloudflare_id}"\n'
             ),
+            "modules/example/unquoted-id.tf": (
+                f"id = {cloudflare_id}\n"
+            ),
             "modules/example/image-like.tf": (
                 f'hostname = "{image_like_hostname}"\n'
             ),
@@ -444,6 +448,202 @@ class PublicRepositoryTest(unittest.TestCase):
                 self.assertNotIn(
                     cloudflare_id, result.stdout + result.stderr
                 )
+
+    def test_rejects_decoded_metadata_in_hcl_strings(self):
+        hostname = ".".join(("private", "invalid"))
+        escaped_hostname = "private" + "\\u002e" + "invalid"
+        escaped_email = "owner" + "\\u0040" + escaped_hostname
+        cloudflare_id = "1" * 32
+        escaped_cloudflare_id = "\\u0031" * 32
+        cases = {
+            "modules/example/main.tf": (
+                f'hostname = "{escaped_hostname}"\n'
+            ),
+            "modules/example/terraform.tfvars": (
+                f'email = "{escaped_email}"\n'
+            ),
+            "modules/example/terraform.auto.tfvars": (
+                f'id = "{escaped_cloudflare_id}"\n'
+            ),
+            "modules/example/tests/basic.tftest.hcl": (
+                'hostname = "private\\U0000002einvalid"\n'
+            ),
+            "modules/example/key.tf": (
+                f'value = {{ "{escaped_hostname}" = true }}\n'
+            ),
+        }
+        for path, content in cases.items():
+            with self.subTest(path=path):
+                result = self.scan({path: content})
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(
+                    hostname, result.stdout + result.stderr
+                )
+                self.assertNotIn(
+                    cloudflare_id, result.stdout + result.stderr
+                )
+
+    def test_rejects_decoded_secret_signatures_in_hcl_strings(self):
+        values = {
+            "github": "ghp_" + ("A" * 24),
+            "aws": "AKIA" + ("A" * 16),
+            "age": "AGE-SECRET-KEY-1" + ("A" * 24),
+            "private-key": ("-" * 5) + "BEGIN PRIVATE KEY" + ("-" * 5),
+        }
+        for label, value in values.items():
+            with self.subTest(label=label):
+                escaped = f"\\u{ord(value[0]):04x}{value[1:]}"
+                result = self.scan(
+                    {"modules/example/main.tf": f'value = "{escaped}"\n'}
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_decoded_values_in_nested_hcl_expression_strings(self):
+        hostname = ".".join(("private", "invalid"))
+        email = "owner@" + hostname
+        cloudflare_id = "1" * 32
+        github_value = "ghp_" + ("A" * 24)
+        cases = {
+            "quoted-hostname": (
+                'value = "${format("private\\u002einvalid")}"\n',
+                "non-example-hostname",
+                hostname,
+            ),
+            "quoted-email": (
+                'value = "${format("owner\\u0040private\\u002einvalid")}"\n',
+                "non-public-email-domain",
+                email,
+            ),
+            "quoted-id": (
+                'value = "${format("' + ("\\u0031" * 32) + '")}"\n',
+                "non-sentinel-cloudflare-id",
+                cloudflare_id,
+            ),
+            "quoted-secret": (
+                'value = "${format("\\u0067hp_' + ("A" * 24) + '")}"\n',
+                "github-secret-format",
+                github_value,
+            ),
+            "heredoc-hostname": (
+                'value = <<EOT\n${format("private\\u002einvalid")}\nEOT\n',
+                "non-example-hostname",
+                hostname,
+            ),
+            "terraform-json-hostname": (
+                json.dumps(
+                    {
+                        "value": '${format("private\\u002einvalid")}',
+                    }
+                ),
+                "non-example-hostname",
+                hostname,
+            ),
+            "terraform-json-secret": (
+                json.dumps(
+                    {
+                        "value": '${format("\\u0067hp_'
+                        + ("A" * 24)
+                        + '")}',
+                    }
+                ),
+                "github-secret-format",
+                github_value,
+            ),
+        }
+        for label, (content, expected_rule, decoded_value) in cases.items():
+            with self.subTest(label=label):
+                suffix = ".tf.json" if label.startswith("terraform-json") else ".tf"
+                result = self.scan(
+                    {f"modules/example/{label}{suffix}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected_rule, result.stdout)
+                self.assertNotIn(
+                    decoded_value, result.stdout + result.stderr
+                )
+
+    def test_rejects_values_in_nested_terraform_json_heredocs(self):
+        hostname = ".".join(("private", "invalid"))
+        email = "owner@" + hostname
+        cloudflare_id = "1" * 32
+        github_value = "ghp_" + ("A" * 24)
+        secret_name = "_".join(("github", "token"))
+        literal_value = "literal-" + ("x" * 24)
+        cases = {
+            "hostname": (hostname, "non-example-hostname", hostname),
+            "email": (email, "non-public-email-domain", email),
+            "id": (
+                cloudflare_id,
+                "non-sentinel-cloudflare-id",
+                cloudflare_id,
+            ),
+            "signature": (
+                github_value,
+                "github-secret-format",
+                github_value,
+            ),
+            "named-secret": (
+                f'{secret_name} = "{literal_value}"',
+                "named-secret-format",
+                literal_value,
+            ),
+        }
+        for label, (body, expected_rule, hidden_value) in cases.items():
+            with self.subTest(label=label):
+                expression = f"${{jsonencode(<<EOT\n{body}\nEOT\n)}}"
+                result = self.scan(
+                    {
+                        "modules/example/main.tf.json": json.dumps(
+                            {"value": expression}
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected_rule, result.stdout)
+                self.assertNotIn(
+                    hidden_value, result.stdout + result.stderr
+                )
+
+    def test_does_not_decode_nested_terraform_json_heredoc_escapes(self):
+        body = "private" + "\\u002e" + "invalid"
+        expression = f"${{jsonencode(<<EOT\n{body}\nEOT\n)}}"
+        result = self.scan(
+            {
+                "modules/example/main.tf.json": json.dumps(
+                    {"value": expression}
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_does_not_decode_nested_hcl_expression_escapes_twice(self):
+        expression = '${format("private\\\\u002einvalid")}'
+        cases = {
+            "quoted.tf": f'value = "{expression}"\n',
+            "heredoc.tf": f"value = <<EOT\n{expression}\nEOT\n",
+            "main.tf.json": json.dumps({"value": expression}),
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_does_not_decode_hcl_escapes_in_heredocs_or_twice(self):
+        escaped_hostname = "private" + "\\u002e" + "invalid"
+        result = self.scan(
+            {
+                "modules/example/main.tf": (
+                    f'quoted = "private\\\\u002einvalid"\n'
+                    "heredoc = <<EOT\n"
+                    f"{escaped_hostname}\n"
+                    "EOT\n"
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_dynamic_template_boundaries_do_not_merge_metadata(self):
         hostname_template = 'private${format(".invalid")}'
@@ -884,6 +1084,185 @@ class PublicRepositoryTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_rejects_escaped_native_hcl_named_secret_keys(self):
+        value = "literal-" + ("x" * 24)
+        escaped_names = (
+            "\\u0067ithub_token",
+            "cloudflare_api_\\u0074oken",
+            "AWS_SECRET_ACCESS_\\u004bEY",
+        )
+        for escaped_name in escaped_names:
+            with self.subTest(escaped_name=escaped_name):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            f'value = {{ "{escaped_name}" = "{value}" }}\n'
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_does_not_decode_native_hcl_named_secret_keys_twice(self):
+        escaped_name = "\\\\u0067ithub_token"
+        value = "literal-" + ("x" * 24)
+        result = self.scan(
+            {
+                "modules/example/main.tf": (
+                    f'value = {{ "{escaped_name}" = "{value}" }}\n'
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_escaped_named_secret_keys_in_hcl_expressions(self):
+        value = "literal-" + ("x" * 24)
+        expression = (
+            '${jsonencode({ "\\u0067ithub_token" = "'
+            + value
+            + '" })}'
+        )
+        cases = {
+            "quoted.tf": f'value = "{expression}"\n',
+            "heredoc.tf": f"value = <<EOT\n{expression}\nEOT\n",
+            "main.tf.json": json.dumps({"value": expression}),
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_terraform_json_scans_only_active_template_expressions_as_hcl(self):
+        escaped_name = "\\u0067ithub_token"
+        literal = f'"{escaped_name}" = "literal"'
+        cases = {
+            "literal-text": literal,
+            "escaped-template": f"$${{jsonencode({{ {literal} }})}}",
+        }
+        for label, value in cases.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf.json": json.dumps(
+                            {"value": value}
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_unquoted_secret_keys_in_terraform_json_expressions(self):
+        name = "_".join(("github", "token"))
+        aws_name = "_".join(("AWS", "SECRET", "ACCESS", "KEY"))
+        cases = {
+            "static": f'{name} = "literal-secret"',
+            "mixed": f'{name} = "${{var.prefix}}literal"',
+            "scalar": f"{name} = 123",
+            "aws": f'{aws_name} = "literal-secret"',
+        }
+        for label, assignment in cases.items():
+            with self.subTest(label=label):
+                expression = f"${{jsonencode({{ {assignment} }})}}"
+                result = self.scan(
+                    {
+                        "modules/example/main.tf.json": json.dumps(
+                            {"value": expression}
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+
+    def test_accepts_empty_and_dynamic_unquoted_secret_keys_in_json_expressions(self):
+        name = "_".join(("github", "token"))
+        for label, value in {
+            "empty": '""',
+            "dynamic": "var.token",
+        }.items():
+            with self.subTest(label=label):
+                expression = (
+                    f"${{jsonencode({{ {name} = {value} }})}}"
+                )
+                result = self.scan(
+                    {
+                        "modules/example/main.tf.json": json.dumps(
+                            {"value": expression}
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_safe_named_secret_keys_in_hcl_expressions(self):
+        value = "literal-" + ("x" * 24)
+        dynamic_expression = (
+            '${jsonencode({ "\\u0067ithub_token" = var.token })}'
+        )
+        escaped_expression = (
+            '${jsonencode({ "\\\\u0067ithub_token" = "'
+            + value
+            + '" })}'
+        )
+        for label, expression in {
+            "dynamic": dynamic_expression,
+            "double-escaped": escaped_expression,
+        }.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            f'value = "{expression}"\n'
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_parenthesized_named_secret_keys(self):
+        value = "literal-" + ("x" * 24)
+        keys = ("github_token", "\\u0067ithub_token")
+        for key in keys:
+            for filename, content in {
+                "main.tf": f'value = {{ ("{key}") = "{value}" }}\n',
+                "main.tf.json": json.dumps(
+                    {
+                        "value": (
+                            '${jsonencode({ ("'
+                            + key
+                            + '") = "'
+                            + value
+                            + '" })}'
+                        )
+                    }
+                ),
+            }.items():
+                with self.subTest(key=key, filename=filename):
+                    result = self.scan(
+                        {f"modules/example/{filename}": content}
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_accepts_safe_parenthesized_keys_and_ternary_strings(self):
+        plain_name = "_".join(("github", "token"))
+        escaped_name = "\\u0067ithub_token"
+        dynamic = f'value = {{ ("{escaped_name}") = var.token }}\n'
+        empty = f'value = {{ ("{escaped_name}") = "" }}\n'
+        ternaries = (
+            f'value = var.enabled ? "{plain_name}" : "ordinary"\n',
+            f'value = var.enabled ? "{escaped_name}" : "ordinary"\n',
+        )
+        for label, content in {
+            "dynamic": dynamic,
+            "empty": empty,
+            "plain-ternary": ternaries[0],
+            "escaped-ternary": ternaries[1],
+        }.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {"modules/example/main.tf": content}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_prefixed_non_hcl_secret_assignments(self):
         aws_name = "_".join(("AWS", "SECRET", "ACCESS", "KEY"))
         value = "literal-" + ("x" * 24)
@@ -947,6 +1326,292 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_accepts_empty_literals_in_dynamic_named_secret_values(self):
+        name = "_".join(("cloudflare", "api", "token"))
+        github_name = "_".join(("github", "token"))
+        cases = {
+            "try.tf": f'{name} = try(var.token, "")\n',
+            "conditional.tf": (
+                f'{name} = var.enabled ? var.token : ""\n'
+            ),
+            "empty.tf": f'{name} = ""\n',
+            "empty-heredoc.tf": f"{name} = <<EOT\nEOT\n",
+            "empty-indented-heredoc.tf": (
+                f"{name} = <<-EOT\n  EOT\n"
+            ),
+            "empty-heredoc-fallback.tf": (
+                f"{name} = try(var.token, <<EOT\nEOT\n)\n"
+            ),
+            "main.tf.json": json.dumps(
+                {
+                    name: '${try(var.token, "")}',
+                    github_name: "",
+                }
+            ),
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_hcl_heredoc_delimiters_preserve_literal_boundaries(self):
+        name = "_".join(("cloudflare", "api", "token"))
+        escaped_hostname = "private\\u002einvalid"
+        for label, terminator in {
+            "hyphenated": "END-OF-TEXT",
+            "unicode": "é",
+        }.items():
+            with self.subTest(label=label, context="empty-secret"):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            f"{name} = <<{terminator}\n{terminator}\n"
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            with self.subTest(label=label, context="raw-body"):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            f"value = <<{terminator}\n"
+                            f'"{escaped_hostname}"\n'
+                            f"{terminator}\n"
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            with self.subTest(label=label, context="nonempty-secret"):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            f"{name} = <<{terminator}\n"
+                            "literal-secret\n"
+                            f"{terminator}\n"
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+
+            with self.subTest(label=label, context="following-string"):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            f"value = <<{terminator}\n"
+                            "safe\n"
+                            f"{terminator}\n"
+                            f'next = "{escaped_hostname}"\n'
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+
+    def test_rejects_nonempty_blank_named_secret_literal(self):
+        name = "_".join(("cloudflare", "api", "token"))
+        result = self.scan(
+            {"modules/example/main.tf": f'{name} = " "\n'}
+        )
+        self.assertEqual(result.returncode, 1)
+
+    def test_rejects_static_non_string_named_secret_values(self):
+        name = "_".join(("cloudflare", "api", "token"))
+        cases = {
+            "direct-number.tf": f"{name} = 123\n",
+            "direct-boolean.tf": f"{name} = true\n",
+            "numeric-fallback.tf": (
+                f"{name} = try(var.token, 123)\n"
+            ),
+            "boolean-branch.tf": (
+                f"{name} = var.enabled ? var.token : false\n"
+            ),
+            "numeric-list.tf": f"{name} = [var.token, 123]\n",
+            "boolean-object.tf": (
+                f"{name} = {{ value = true }}\n"
+            ),
+            "numeric-template.tf": (
+                f'{name} = "${{var.token}}${{123}}"\n'
+            ),
+            "direct-number.tf.json": json.dumps({name: 123}),
+            "direct-boolean.tf.json": json.dumps({name: True}),
+            "numeric-expression.tf.json": json.dumps(
+                {name: "${123}"}
+            ),
+            "numeric-fallback.tf.json": json.dumps(
+                {name: "${try(var.token, 123)}"}
+            ),
+            "boolean-template.tf.json": json.dumps(
+                {name: "${var.token}${false}"}
+            ),
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+
+    def test_rejects_static_comparison_in_nested_conditional_branch(self):
+        name = "_".join(("github", "token"))
+        expression = (
+            "var.enabled ? (1 < 2) : "
+            "(true ? var.token : null)"
+        )
+        for filename, content in {
+            "main.tf": f"{name} = {expression}\n",
+            "main.tf.json": json.dumps({name: "${" + expression + "}"}),
+        }.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+
+    def test_rejects_static_comparison_before_sibling_conditional(self):
+        name = "_".join(("github", "token"))
+        expressions = {
+            "tuple": "[1 < 2, true ? null : null]",
+            "object": (
+                "{ first = 1 < 2, "
+                "second = true ? null : null }"
+            ),
+        }
+        for label, expression in expressions.items():
+            for filename, content in {
+                "main.tf": f"{name} = {expression}\n",
+                "main.tf.json": json.dumps(
+                    {name: "${" + expression + "}"}
+                ),
+            }.items():
+                with self.subTest(label=label, filename=filename):
+                    result = self.scan(
+                        {f"modules/example/{filename}": content}
+                    )
+                    self.assertEqual(result.returncode, 1)
+
+    def test_rejects_object_key_returned_as_named_secret_value(self):
+        name = "_".join(("github", "token"))
+        expression = 'keys({ "literal-secret" = null })[0]'
+        for filename, content in {
+            "main.tf": f"{name} = {expression}\n",
+            "main.tf.json": json.dumps(
+                {name: "${" + expression + "}"}
+            ),
+        }.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+
+    def test_accepts_scalar_control_in_for_expression_filter(self):
+        name = "_".join(("github", "token"))
+        expression = (
+            "one([for token in var.tokens : token "
+            "if length(token) > 0])"
+        )
+        for filename, content in {
+            "main.tf": f"{name} = {expression}\n",
+            "main.tf.json": json.dumps(
+                {name: "${" + expression + "}"}
+            ),
+        }.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_provider_qualified_functions_do_not_inherit_builtin_exemptions(self):
+        name = "_".join(("github", "token"))
+        cases = {
+            "lookup.tf": (
+                f'{name} = provider::demo::lookup('
+                'var.tokens, "literal-secret")\n'
+            ),
+            "substr.tf": (
+                f"{name} = provider::demo::substr(var.token, 123, 456)\n"
+            ),
+            "main.tf.json": json.dumps(
+                {
+                    name: (
+                        '${provider::demo::lookup('
+                        'var.tokens, "literal-secret")}'
+                    )
+                }
+            ),
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+
+    def test_accepts_non_string_selectors_keys_and_null_secret_values(self):
+        name = "_".join(("cloudflare", "api", "token"))
+        second_name = "_".join(("cloudflare", "token"))
+        third_name = "_".join(("github", "token"))
+        cases = {
+            "numeric-index.tf": f"{name} = var.tokens[0]\n",
+            "numeric-lookup.tf": (
+                f"{name} = lookup(var.tokens, 0)\n"
+            ),
+            "numeric-object-key.tf": (
+                f"{name} = {{ 0 = var.token }}\n"
+            ),
+            "parenthesized-numeric-object-key.tf": (
+                f"{name} = {{ (0) = var.token }}\n"
+            ),
+            "element-selector.tf": (
+                f"{name} = element(var.tokens, 0)\n"
+            ),
+            "slice-selectors.tf": (
+                f"{name} = one(slice(var.tokens, 0, 1))\n"
+            ),
+            "predicate.tf": (
+                f'{name} = length(var.tokens) > 0 ? var.tokens[0] : ""\n'
+            ),
+            "substr-control.tf": (
+                f"{name} = substr(var.token, 0, -1)\n"
+            ),
+            "nested-element-control.tf": (
+                f"{name} = element(var.tokens, max(var.index, 0))\n"
+            ),
+            "hyphenated-number-identifier.tf": (
+                f"{name} = var.token-123\n"
+            ),
+            "hyphenated-boolean-identifier.tf": (
+                f"{name} = var.not-true\n"
+            ),
+            "boolean-prefixed-object-keys.tf": (
+                f"{name} = {{ true-value = var.token, "
+                "false-value = var.other }}\n"
+            ),
+            "null-fallback.tf": (
+                f"{name} = try(var.token, null)\n"
+            ),
+            "selectors.tf.json": json.dumps(
+                {
+                    name: "${var.tokens[0]}",
+                    second_name: '${lookup(var.tokens, 0)}',
+                    third_name: (
+                        "${length(var.tokens) > 0 ? "
+                        "var.tokens[0] : null}"
+                    ),
+                }
+            ),
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_named_secret_in_malformed_json(self):
         name = "_".join(("github", "token"))
         value = "literal-" + ("x" * 24)
@@ -991,6 +1656,77 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("named-secret-format", result.stdout)
         self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_quoted_named_secret_assignments_in_literal_contexts(self):
+        name = "_".join(("github", "token"))
+        value = "literal-" + ("x" * 24)
+        assignment = f'"{name}" = "{value}"'
+        escaped_assignment = assignment.replace('"', '\\"')
+        cases = {
+            "heredoc.tf": f"value = <<EOT\n{assignment}\nEOT\n",
+            "string.tf": f'value = "prefix {escaped_assignment}"\n',
+            "comment.tf": f"# {assignment}\n",
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_accepts_function_wrapped_secret_like_ternary_string(self):
+        name = "_".join(("github", "token"))
+        result = self.scan(
+            {
+                "modules/example/main.tf": (
+                    f'value = var.enabled ? upper("{name}") : "ordinary"\n'
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_compound_static_named_secret_expressions(self):
+        first_name = "_".join(("github", "token"))
+        second_name = "_".join(("cloudflare", "token"))
+        cases = {
+            "boolean.tf": f"{first_name} = true && false\n",
+            "comparison.tf": f"{second_name} = 1 < 2\n",
+            "main.tf.json": json.dumps(
+                {
+                    first_name: "${true && false}",
+                    second_name: "${1 < 2}",
+                }
+            ),
+        }
+        for filename, content in cases.items():
+            with self.subTest(filename=filename):
+                result = self.scan(
+                    {f"modules/example/{filename}": content}
+                )
+                self.assertEqual(result.returncode, 1)
+
+    def test_quote_heavy_hcl_scan_is_bounded(self):
+        content = "\n".join(
+            f'value_{index} = "safe-{index}"' for index in range(5000)
+        )
+        started = time.monotonic()
+        result = self.scan({"modules/example/main.tf": content})
+        duration = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(duration, 10)
+
+    def test_scalar_heavy_conditional_scan_is_bounded(self):
+        name = "_".join(("github", "token"))
+        predicate = " && ".join(
+            f"{index} < var.limit" for index in range(3000)
+        )
+        content = f"{name} = {predicate} ? var.token : null\n"
+        started = time.monotonic()
+        result = self.scan({"modules/example/main.tf": content})
+        duration = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(duration, 10)
 
     def test_remote_is_absent_or_the_expected_public_repository(self):
         remotes = subprocess.run(
