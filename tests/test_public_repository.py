@@ -74,6 +74,18 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
 
+    def test_ignores_generated_child_module_lockfiles(self):
+        result = self.scan(
+            {
+                "modules/example/.terraform.lock.hcl": (
+                    'provider "registry.terraform.io/cloudflare/cloudflare" {\n'
+                    '  version = "5.24.0"\n'
+                    "}\n"
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_allows_required_providers_in_child_modules(self):
         result = self.scan(
             {

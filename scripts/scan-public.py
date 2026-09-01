@@ -54,7 +54,7 @@ def _relative_path(root: pathlib.Path, path: pathlib.Path) -> str:
 def _iter_regular_files(root: pathlib.Path):
     for path in sorted(root.rglob("*")):
         relative_parts = path.relative_to(root).parts
-        if ".git" in relative_parts or ".terraform" in relative_parts:
+        if ".git" in relative_parts or ".terraform" in relative_parts or path.name == ".terraform.lock.hcl":
             continue
         if path.is_symlink():
             continue
