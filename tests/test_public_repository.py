@@ -161,7 +161,12 @@ class PublicRepositoryTest(unittest.TestCase):
         )
 
     def test_module_documentation_is_public_and_credential_free(self):
-        module_names = ("dns-records", "google-workspace-mail")
+        module_names = (
+            "access-applications",
+            "cloudflare-tunnel",
+            "dns-records",
+            "google-workspace-mail",
+        )
         for module_name in module_names:
             readme = ROOT / "modules" / module_name / "README.md"
             self.assertTrue(readme.is_file(), readme)
