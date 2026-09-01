@@ -17,8 +17,8 @@ INSTALLER = ROOT / "scripts" / "setup-ci-tools.sh"
 MARKDOWN_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 MARKDOWN_HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
 MARKDOWN_URL = re.compile(r"(?:https?:)?//[^\s<>\"'`]+", re.IGNORECASE)
-MARKDOWN_ASSET_FILENAME = re.compile(
-    r"(?i)(?:^|/)[^/?#]+\.(?:gif|ico|jpe?g|png|svg|webp)(?=/|$)"
+MARKDOWN_ASSET_EXTENSION = re.compile(
+    r"(?i)\.(?:gif|ico|jpe?g|png|svg|webp)(?=/|$)"
 )
 
 
@@ -34,8 +34,8 @@ def markdown_uses_only_example_domains(text: str) -> bool:
         hostname = parsed.hostname
         if hostname is None or not is_example_domain(hostname):
             return False
-        path = MARKDOWN_ASSET_FILENAME.sub(
-            "/", urllib.parse.unquote(parsed.path)
+        path = MARKDOWN_ASSET_EXTENSION.sub(
+            "", urllib.parse.unquote(parsed.path)
         )
         url_residues.append(
             " ".join(
@@ -439,6 +439,14 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertFalse(
             markdown_uses_only_example_domains(
                 f"https://example.com/customers/{forbidden}/logo.svg"
+            )
+        )
+
+    def test_markdown_domain_check_rejects_domain_hidden_in_asset_filename(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(
+                f"https://example.com/{forbidden}.png"
             )
         )
 
