@@ -6,12 +6,36 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import urllib.parse
 import zipfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCANNER = ROOT / "scripts" / "scan-public.py"
 INSTALLER = ROOT / "scripts" / "setup-ci-tools.sh"
+MARKDOWN_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+MARKDOWN_HOSTNAME = re.compile(r"(?<!/)\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+MARKDOWN_URL = re.compile(r"https?://[^\s<>\"'`]+")
+
+
+def is_example_domain(domain: str) -> bool:
+    domain = domain.lower()
+    return domain == "example.com" or domain.endswith(".example.com")
+
+
+def markdown_uses_only_example_domains(text: str) -> bool:
+    for match in MARKDOWN_URL.finditer(text):
+        hostname = urllib.parse.urlsplit(match.group(0)).hostname
+        if hostname is None or not is_example_domain(hostname):
+            return False
+    without_urls = MARKDOWN_URL.sub("", text)
+
+    for match in MARKDOWN_EMAIL.finditer(without_urls):
+        if not is_example_domain(match.group(1)):
+            return False
+    without_emails = MARKDOWN_EMAIL.sub("", without_urls)
+
+    return all(is_example_domain(match.group(0)) for match in MARKDOWN_HOSTNAME.finditer(without_emails))
 
 
 class PublicRepositoryTest(unittest.TestCase):
@@ -150,19 +174,13 @@ class PublicRepositoryTest(unittest.TestCase):
             )
 
         private_repository_name = "-".join(("cloudflare", "infrastructure"))
-        hostname = re.compile(r"(?<!/)\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
-        email = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
         cloudflare_id = re.compile(r"\b[0-9a-fA-F]{32}\b")
         for path in ROOT.rglob("*.md"):
             if ".superpowers" in path.parts:
                 continue
             text = path.read_text(encoding="utf-8")
             self.assertNotIn(private_repository_name, text.lower(), path)
-            without_emails = email.sub("", text)
-            self.assertTrue(
-                all(match.group(0).lower().endswith("example.com") for match in hostname.finditer(without_emails)),
-                path,
-            )
+            self.assertTrue(markdown_uses_only_example_domains(text), path)
             self.assertTrue(
                 all(set(match.group(0)) == {"0"} for match in cloudflare_id.finditer(text)),
                 path,
@@ -174,6 +192,26 @@ class PublicRepositoryTest(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_markdown_domain_check_rejects_suffix_spoof(self):
+        self.assertFalse(markdown_uses_only_example_domains("customerexample.com"))
+
+    def test_markdown_domain_check_rejects_non_example_url_authority(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(f"https://{forbidden}/logo.svg")
+        )
+
+    def test_markdown_domain_check_accepts_example_email_and_url(self):
+        self.assertTrue(
+            markdown_uses_only_example_domains(
+                "owner@example.com https://example.com/logo.svg"
+            )
+        )
+
+    def test_markdown_domain_check_rejects_non_example_email(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(markdown_uses_only_example_domains(f"owner@{forbidden}"))
 
 
 class SetupCiToolsTest(unittest.TestCase):
