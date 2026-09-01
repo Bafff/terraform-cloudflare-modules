@@ -30,7 +30,8 @@ def is_example_domain(domain: str) -> bool:
 def markdown_uses_only_example_domains(text: str) -> bool:
     url_residues = []
     for match in MARKDOWN_URL.finditer(text):
-        parsed = urllib.parse.urlsplit(match.group(0))
+        url = match.group(0).rstrip(".,;:!?")
+        parsed = urllib.parse.urlsplit(url)
         hostname = parsed.hostname
         if hostname is None or not is_example_domain(hostname):
             return False
@@ -222,6 +223,17 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_hcl_comment_cannot_open_heredoc_mode(self):
+        result = self.scan(
+            {
+                "examples/main.tf": (
+                    "# Use <<EOT for a heredoc.\n"
+                    "value = local.settings\n"
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_non_example_hostname_in_hcl_comment(self):
         value = ".".join(("private", "invalid"))
@@ -509,6 +521,13 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertTrue(
             markdown_uses_only_example_domains(
                 "[logo](https://example.com/logo.svg)"
+            )
+        )
+
+    def test_markdown_domain_check_accepts_asset_url_before_prose_punctuation(self):
+        self.assertTrue(
+            markdown_uses_only_example_domains(
+                "See https://example.com/logo.svg, for details."
             )
         )
 

@@ -140,8 +140,11 @@ def _hcl_template_text(line: str) -> str:
     return "".join(literal)
 
 
-def _hcl_hostname_source(line: str, state: HclHostnameState) -> str:
+def _hcl_hostname_source(
+    line: str, state: HclHostnameState
+) -> tuple[str, tuple[str, bool] | None]:
     literal: list[str] = []
+    heredoc = None
     index = 0
     while index < len(line):
         if state.block_comment_depth > 0:
@@ -226,9 +229,15 @@ def _hcl_hostname_source(line: str, state: HclHostnameState) -> str:
         elif line[index] == '"':
             state.in_string = True
             index += 1
+        elif heredoc_match := HCL_HEREDOC.match(line, index):
+            heredoc = (
+                heredoc_match.group("terminator"),
+                heredoc_match.group("allows_indent") == "-",
+            )
+            index = heredoc_match.end()
         else:
             index += 1
-    return "".join(literal)
+    return "".join(literal), heredoc
 
 
 def _iter_regular_files(root: pathlib.Path):
@@ -301,15 +310,9 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                         if is_terminator:
                             heredoc = None
                     else:
-                        hostname_source = _hcl_hostname_source(
+                        hostname_source, heredoc = _hcl_hostname_source(
                             without_emails, hcl_hostname_state
                         )
-                        heredoc_match = HCL_HEREDOC.search(line)
-                        if heredoc_match:
-                            heredoc = (
-                                heredoc_match.group("terminator"),
-                                heredoc_match.group("allows_indent") == "-",
-                            )
                 for match in HOSTNAME.finditer(hostname_source):
                     if not _is_permitted_domain(match.group(0)):
                         findings.append(Finding(relative, line_number, "non-example-hostname"))
