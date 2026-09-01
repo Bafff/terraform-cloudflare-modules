@@ -25,6 +25,15 @@ class JsonObject:
 
 
 @dataclasses.dataclass
+class HclExpressionFrame:
+    opener: str
+    function_name: str | None = None
+    argument_index: int = 0
+    selector_context: bool = False
+    expecting_object_key: bool = False
+
+
+@dataclasses.dataclass
 class HclHostnameState:
     block_comment_depth: int = 0
     in_string: bool = False
@@ -62,6 +71,9 @@ NAMED_SECRET_ASSIGNMENT = re.compile(
 )
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+ASSET_PATH_EXTENSION = re.compile(
+    r"(?i)(?<![:/])/([A-Za-z0-9.-]+)\.(?:gif|ico|jpe?g|png|svg|webp)(?=[/?#\s\"']|$)"
+)
 CLOUDFLARE_ID = re.compile(r"\b[0-9a-fA-F]{32}\b")
 PROVIDER_BLOCK = re.compile(r"\bprovider\s+\"")
 BACKEND_BLOCK = re.compile(r"\bbackend\s+\"")
@@ -72,7 +84,13 @@ HCL_HEREDOC = re.compile(
 
 def _is_permitted_domain(domain: str) -> bool:
     domain = domain.lower()
-    return domain == "example.com" or domain.endswith(".example.com") or domain == "users.noreply.github.com"
+    return (
+        domain == "example.com"
+        or domain.endswith(".example.com")
+        or domain == "users.noreply.github.com"
+        or domain == "2.0.192.in-addr.arpa"
+        or domain.endswith(".2.0.192.in-addr.arpa")
+    )
 
 
 def _relative_path(root: pathlib.Path, path: pathlib.Path) -> str:
@@ -80,7 +98,9 @@ def _relative_path(root: pathlib.Path, path: pathlib.Path) -> str:
 
 
 def _is_hcl_path(path: pathlib.Path) -> bool:
-    return path.suffix in {".tf", ".hcl"} or path.name.endswith(".tf.json")
+    return path.suffix in {".tf", ".hcl", ".tfvars"} or path.name.endswith(
+        (".tf.json", ".tfvars.json", ".tftest.json", ".tfmock.json")
+    )
 
 
 def _assignment_exposes_literal(
@@ -252,7 +272,7 @@ def _hcl_position_is_in_comment_or_string(text: str, position: int) -> bool:
 
 
 def _hcl_expression_exposes_literal(text: str, start: int) -> bool:
-    delimiter_depth = 0
+    frames: list[HclExpressionFrame] = []
     block_comment_depth = 0
     saw_value = False
     index = start
@@ -271,29 +291,91 @@ def _hcl_expression_exposes_literal(text: str, start: int) -> bool:
             index += 2
         elif text.startswith("//", index) or text[index] == "#":
             newline = text.find("\n", index)
-            if saw_value and delimiter_depth == 0:
+            next_line = len(text) if newline == -1 else newline + 1
+            if (
+                saw_value
+                and not frames
+                and not _hcl_expression_continues_at(text, next_line)
+            ):
                 return False
-            index = len(text) if newline == -1 else newline + 1
+            _hcl_maybe_start_next_object_entry(
+                text,
+                index,
+                frames,
+                next_position=next_line,
+            )
+            index = next_line
         elif heredoc_match := HCL_HEREDOC.match(text, index):
             return True
         elif text[index] in {'"', "'"}:
-            exposes_literal, index = _scan_hcl_quoted_string(text, index)
-            if exposes_literal:
+            exposes_literal, string_end = _scan_hcl_quoted_string(
+                text, index
+            )
+            if (
+                exposes_literal
+                and not _hcl_string_is_selector(frames)
+                and not _hcl_string_is_object_key(
+                    text, string_end, frames
+                )
+            ):
                 return True
+            index = string_end
             saw_value = True
         elif text[index] in "([{":
-            delimiter_depth += 1
+            selector_context = _hcl_string_is_selector(frames)
+            function_name = (
+                _hcl_function_name_before(text, index)
+                if text[index] == "("
+                else None
+            )
+            is_index = (
+                text[index] == "["
+                and _hcl_bracket_opens_index(text, index)
+            )
+            frames.append(
+                HclExpressionFrame(
+                    opener="index" if is_index else text[index],
+                    function_name=function_name,
+                    selector_context=selector_context,
+                    expecting_object_key=text[index] == "{",
+                )
+            )
             saw_value = True
             index += 1
-        elif text[index] in ")]}" and delimiter_depth > 0:
-            delimiter_depth -= 1
+        elif text[index] in ")]}" and frames:
+            frames.pop()
             saw_value = True
             index += 1
-        elif text[index] == "," and delimiter_depth == 0:
-            return False
-        elif text[index] == "\n" and delimiter_depth == 0:
-            if saw_value:
+        elif text[index] == ",":
+            if not frames:
                 return False
+            if frames[-1].opener == "{":
+                frames[-1].expecting_object_key = True
+            else:
+                frames[-1].argument_index += 1
+            index += 1
+        elif (
+            text[index] in "=:"
+            and frames
+            and frames[-1].opener == "{"
+            and frames[-1].expecting_object_key
+            and not text.startswith("==", index)
+        ):
+            frames[-1].expecting_object_key = False
+            index += 1
+        elif text[index] == "\n":
+            if not frames:
+                if saw_value and not _hcl_expression_continues_at(
+                    text, index + 1
+                ):
+                    return False
+            else:
+                _hcl_maybe_start_next_object_entry(
+                    text,
+                    index,
+                    frames,
+                    next_position=index + 1,
+                )
             index += 1
         elif text[index].isspace():
             index += 1
@@ -301,6 +383,166 @@ def _hcl_expression_exposes_literal(text: str, start: int) -> bool:
             saw_value = True
             index += 1
     return False
+
+
+def _hcl_function_name_before(text: str, position: int) -> str | None:
+    significant = _hcl_previous_significant_position(text, position)
+    if significant is None:
+        return None
+    index = significant
+    end = index + 1
+    while index >= 0 and (text[index].isalnum() or text[index] == "_"):
+        index -= 1
+    return text[index + 1 : end] or None
+
+
+def _hcl_maybe_start_next_object_entry(
+    text: str,
+    position: int,
+    frames: list[HclExpressionFrame],
+    *,
+    next_position: int,
+) -> None:
+    if (
+        not frames
+        or frames[-1].opener != "{"
+        or frames[-1].expecting_object_key
+    ):
+        return
+    previous = _hcl_previous_significant_character(text, position)
+    if (
+        previous is not None
+        and previous not in "?=:,+-*/%&|!<>.([{"
+        and not _hcl_expression_continues_at(text, next_position)
+    ):
+        frames[-1].expecting_object_key = True
+
+
+def _hcl_previous_significant_character(
+    text: str, position: int
+) -> str | None:
+    index = _hcl_previous_significant_position(text, position)
+    return None if index is None else text[index]
+
+
+def _hcl_previous_significant_position(
+    text: str, position: int
+) -> int | None:
+    last_significant: int | None = None
+    block_comment_depth = 0
+    quote: str | None = None
+    index = 0
+    while index < position:
+        if block_comment_depth:
+            if text.startswith("/*", index):
+                block_comment_depth += 1
+                index += 2
+            elif text.startswith("*/", index):
+                block_comment_depth -= 1
+                index += 2
+            else:
+                index += 1
+        elif quote is not None:
+            last_significant = index
+            if text[index] == "\\" and index + 1 < position:
+                index += 2
+            elif text[index] == quote:
+                quote = None
+                index += 1
+            else:
+                index += 1
+        elif text.startswith("/*", index):
+            block_comment_depth = 1
+            index += 2
+        elif text.startswith("//", index) or text[index] == "#":
+            newline = text.find("\n", index, position)
+            index = position if newline == -1 else newline + 1
+        elif text[index] in {'"', "'"}:
+            quote = text[index]
+            last_significant = index
+            index += 1
+        elif text[index].isspace():
+            index += 1
+        else:
+            last_significant = index
+            index += 1
+    return last_significant
+
+
+def _hcl_next_significant_position(
+    text: str, position: int
+) -> int | None:
+    while position < len(text):
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if text.startswith("/*", position):
+            depth = 1
+            position += 2
+            while position < len(text) and depth:
+                if text.startswith("/*", position):
+                    depth += 1
+                    position += 2
+                elif text.startswith("*/", position):
+                    depth -= 1
+                    position += 2
+                else:
+                    position += 1
+            continue
+        if text.startswith("//", position) or (
+            position < len(text) and text[position] == "#"
+        ):
+            newline = text.find("\n", position)
+            position = len(text) if newline == -1 else newline + 1
+            continue
+        return position
+    return None
+
+
+def _hcl_expression_continues_at(text: str, position: int) -> bool:
+    position = _hcl_next_significant_position(text, position)
+    return (
+        position is not None
+        and text[position] in "?=:,+-*/%&|!<>.(["
+    )
+
+
+def _hcl_bracket_opens_index(text: str, position: int) -> bool:
+    previous = _hcl_previous_significant_character(text, position)
+    return previous is not None and (
+        previous.isalnum() or previous in "_.)]}"
+    )
+
+
+def _hcl_string_is_selector(
+    frames: list[HclExpressionFrame],
+) -> bool:
+    if not frames:
+        return False
+    frame = frames[-1]
+    return bool(
+        frame.selector_context
+        or frame.opener == "index"
+        or (
+            frame.function_name == "lookup"
+            and frame.argument_index == 1
+        )
+    )
+
+
+def _hcl_string_is_object_key(
+    text: str, string_end: int, frames: list[HclExpressionFrame]
+) -> bool:
+    if (
+        not frames
+        or frames[-1].opener != "{"
+        or not frames[-1].expecting_object_key
+    ):
+        return False
+    index = _hcl_next_significant_position(text, string_end)
+    return index is not None and (
+        text[index] == ":"
+        or (text[index] == "=" and not text.startswith("==", index))
+    )
 
 
 def _json_contains_static_named_secret(value: object) -> bool:
@@ -354,6 +596,8 @@ def _hcl_hostname_source(
                 index += 2
             elif line.startswith("*/", index):
                 state.block_comment_depth -= 1
+                if state.block_comment_depth == 0:
+                    literal.append(" ")
                 index += 2
             else:
                 literal.append(line[index])
@@ -364,6 +608,8 @@ def _hcl_hostname_source(
                 index += 2
             elif line.startswith("*/", index):
                 state.expression_comment_depth -= 1
+                if state.expression_comment_depth == 0:
+                    literal.append(" ")
                 index += 2
             else:
                 literal.append(line[index])
@@ -387,6 +633,7 @@ def _hcl_hostname_source(
                 index += 2
             elif line[index] == '"':
                 state.expression_string = False
+                literal.append(" ")
                 index += 1
             else:
                 literal.append(line[index])
@@ -455,6 +702,7 @@ def _hcl_hostname_source(
                 index += 2
             elif line[index] == '"':
                 state.in_string = False
+                literal.append(" ")
                 index += 1
             else:
                 literal.append(line[index])
@@ -555,7 +803,9 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                         )
         in_example = pathlib.PurePosixPath(relative).parts[:1] == ("examples",)
         in_module = pathlib.PurePosixPath(relative).parts[:1] == ("modules",)
-        in_metadata_scope = in_example or (in_module and path.suffix == ".tf")
+        in_metadata_scope = in_example or (
+            in_module and _is_hcl_path(path)
+        )
         heredoc_stack: list[tuple[str, bool, HclHostnameState]] = []
         hcl_hostname_state = HclHostnameState()
         for line_number, line in enumerate(text.splitlines(), start=1):
@@ -575,7 +825,7 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
             if in_metadata_scope:
                 without_emails = EMAIL.sub("", line)
                 hostname_source = without_emails
-                if path.suffix in {".tf", ".hcl"}:
+                if _is_hcl_path(path):
                     if heredoc_stack:
                         terminator, allows_indent, heredoc_hostname_state = (
                             heredoc_stack[-1]
@@ -618,6 +868,9 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                                     HclHostnameState(in_heredoc=True),
                                 )
                             )
+                hostname_source = ASSET_PATH_EXTENSION.sub(
+                    r"/\1", hostname_source
+                )
                 for match in HOSTNAME.finditer(hostname_source):
                     if not _is_permitted_domain(match.group(0)):
                         findings.append(Finding(relative, line_number, "non-example-hostname"))

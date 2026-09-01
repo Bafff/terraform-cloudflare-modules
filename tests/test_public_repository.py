@@ -317,6 +317,21 @@ class PublicRepositoryTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_hcl_comment_and_string_boundaries_do_not_merge_hostnames(self):
+        prefix = "private."
+        suffix = "invalid"
+        for label, content in {
+            "ordinary": f'/*{prefix}*/value = "{suffix}"\n',
+            "expression": (
+                f'value = "${{lower(/*{prefix}*/"{suffix}")}}"\n'
+            ),
+        }.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {"modules/example/main.tf": content}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_non_example_hostname_in_module_hcl(self):
         value = ".".join(("private", "invalid"))
         result = self.scan(
@@ -324,6 +339,62 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_metadata_in_all_terraform_module_formats(self):
+        hostname = ".".join(("private", "invalid"))
+        image_like_hostname = ".".join(("private", "svg"))
+        cloudflare_id = "1" * 32
+        cases = {
+            "modules/example/main.tf.json": json.dumps(
+                {"hostname": hostname}
+            ),
+            "modules/example/tests/basic.tftest.hcl": (
+                f'hostname = "{hostname}"\n'
+            ),
+            "modules/example/terraform.tfvars": (
+                f'hostname = "{hostname}"\n'
+            ),
+            "modules/example/terraform.auto.tfvars": (
+                f'hostname = "{hostname}"\n'
+            ),
+            "modules/example/terraform.tfvars.json": json.dumps(
+                {"hostname": hostname}
+            ),
+            "modules/example/terraform.auto.tfvars.json": json.dumps(
+                {"hostname": hostname}
+            ),
+            "modules/example/tests/basic.tftest.json": json.dumps(
+                {"hostname": hostname}
+            ),
+            "modules/example/tests/defaults.tfmock.json": json.dumps(
+                {"hostname": hostname}
+            ),
+            "modules/example/tests/id.tftest.hcl": (
+                f'id = "{cloudflare_id}"\n'
+            ),
+            "modules/example/image-like.tf": (
+                f'hostname = "{image_like_hostname}"\n'
+            ),
+            "modules/example/url-authority.tf": (
+                f'url = "https://{image_like_hostname}"\n'
+            ),
+            "modules/example/scheme-relative-authority.tf": (
+                f'url = "//{image_like_hostname}"\n'
+            ),
+        }
+        for path, content in cases.items():
+            with self.subTest(path=path):
+                result = self.scan({path: content})
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(
+                    hostname, result.stdout + result.stderr
+                )
+                self.assertNotIn(
+                    cloudflare_id, result.stdout + result.stderr
+                )
+                self.assertNotIn(
+                    image_like_hostname, result.stdout + result.stderr
+                )
 
     def test_rejects_non_sentinel_cloudflare_id_in_module_hcl(self):
         value = "1" * 32
@@ -487,6 +558,81 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_accepts_dynamic_named_secret_lookups_with_string_keys(self):
+        name = "_".join(("cloudflare", "api", "token"))
+        for label, value in {
+            "index": 'var.tokens["cloudflare"]',
+            "lookup": 'lookup(var.tokens, "cloudflare")',
+            "wrapped-lookup": 'sensitive(lookup(var.tokens, "cloudflare"))',
+            "object-key": 'lookup({ "cloudflare" = var.token }, "cloudflare")',
+            "index-after-block-comment": (
+                'var.tokens /* selector */ ["cloudflare"]'
+            ),
+            "function-before-block-comment": (
+                'lookup /* call */ (var.tokens, "cloudflare")'
+            ),
+            "object-key-before-block-comment": (
+                '{ "cloudflare" /* key */ = var.token }'
+            ),
+            "index-after-hash-comment": (
+                "sensitive(var.tokens # selector!\n"
+                '["cloudflare"])'
+            ),
+            "index-after-slash-comment": (
+                "sensitive(var.tokens // selector!\n"
+                '["cloudflare"])'
+            ),
+            "function-before-hash-comment": (
+                "sensitive(lookup # call\n"
+                '(var.tokens, "cloudflare"))'
+            ),
+            "function-before-slash-comment": (
+                "sensitive(lookup // call\n"
+                '(var.tokens, "cloudflare"))'
+            ),
+            "newline-object-keys": (
+                "{\n"
+                '  "first" = var.first # dynamic\n'
+                '  "second" = var.second\n'
+                "}"
+            ),
+            "newline-object-keys-inline-block-comment": (
+                "{\n"
+                '  "first" = var.first /* dynamic */\n'
+                '  "second" = var.second\n'
+                "}"
+            ),
+            "newline-object-keys-multiline-block-comment": (
+                "{\n"
+                '  "first" = var.first /* dynamic\n'
+                "  value */\n"
+                '  "second" = var.second\n'
+                "}"
+            ),
+        }.items():
+            with self.subTest(label=label):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            f"{name} = {value}\n"
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_asset_url_query_and_fragment_in_module_hcl(self):
+        for suffix in ("?version=1", "#logo"):
+            with self.subTest(suffix=suffix):
+                result = self.scan(
+                    {
+                        "modules/example/main.tf": (
+                            'url = "https://example.com/logo.svg'
+                            f'{suffix}"\n'
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_accepts_dynamic_named_secret_after_url_string(self):
         name = "_".join(("github", "token"))
         result = self.scan(
@@ -528,7 +674,52 @@ class PublicRepositoryTest(unittest.TestCase):
             "nested-comment-before-equals.tf": f'{name} /* outer /* nested */ note */ = "{value}"\n',
             "inline-object-heredoc.tf": f"value = {{ {name} = sensitive(<<EOT\n{value}\nEOT\n) }}\n",
             "mixed-template.tf": f'{name} = "${{var.prefix}}{value}"\n',
+            "object-ternary.tf": f'{name} = {{ value = var.enabled ? "{value}" : var.token }}\n',
+            "multiline-object-ternary.tf": (
+                f"{name} = {{\n"
+                "  value = (\n"
+                "    var.enabled\n"
+                f'    ? "{value}"\n'
+                "    : var.token\n"
+                "  )\n"
+                "}\n"
+            ),
+            "malformed-multiline-ternary.tf": (
+                f"{name} = var.enabled\n"
+                f'? "{value}"\n'
+                ": var.token\n"
+            ),
+            "malformed-object-multiline-ternary.tf": (
+                f"{name} = {{\n"
+                "  value = var.enabled\n"
+                f'  ? "{value}"\n'
+                "  : var.token\n"
+                "}\n"
+            ),
+            "malformed-commented-multiline-ternary.tf": (
+                f"{name} = var.enabled\n"
+                "# continuation\n"
+                f'? "{value}"\n'
+                ": var.token\n"
+            ),
+            "malformed-commented-object-ternary.tf": (
+                f"{name} = {{\n"
+                "  value = var.enabled\n"
+                "  # continuation\n"
+                f'  ? "{value}"\n'
+                "  : var.token\n"
+                "}\n"
+            ),
+            "object-equality.tf": f'{name} = {{ value = "{value}" == var.token }}\n',
             "wrapped-literal.tf": f'{name} = sensitive("{value}")\n',
+            "wrapped-literal-after-hash-comment.tf": (
+                f"{name} = sensitive # call\n"
+                f'("{value}")\n'
+            ),
+            "wrapped-literal-after-slash-comment.tf": (
+                f"{name} = sensitive // call\n"
+                f'("{value}")\n'
+            ),
             "wrapped-mixed-template.tf": f'{name} = sensitive("${{var.prefix}}{value}")\n',
             "comment-after-equals.tf": f'{name} = /* note */ "{value}"\n',
             "multiline-comment-after-equals.tf": f'{name} = /*\nnote\n*/ "{value}"\n',
