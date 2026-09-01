@@ -62,11 +62,81 @@ class PublicRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_accepts_terraform_traversals_in_examples(self):
+        result = self.scan(
+            {
+                "examples/main.tf": (
+                    'target = module.cloudflare_tunnel.cloudflare_zero_trust_tunnel_cloudflared.this\n'
+                    'domain = "docs.${var.domain}"\n'
+                    'content = "${module.cloudflare_tunnel.tunnel_id}.tunnel.example.com"\n'
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_non_example_metadata_without_echoing_it(self):
         value = ".".join(("private", "invalid"))
         result = self.scan({"examples/main.tf": f'domain = "{value}"\n'})
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_hcl_heredoc(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan({"examples/main.tf": f"value = <<EOT\n{value}\nEOT\n"})
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_hcl_comment(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan({"examples/main.tf": f"# {value}\n"})
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_hcl_block_comment(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan({"examples/main.tf": f"/* {value} */\n"})
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_nested_multiline_hcl_block_comment(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan(
+            {"examples/main.tf": f"/* outer\n/* nested */\n{value}\n*/\n"}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_nested_hcl_template_string(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan(
+            {"examples/main.tf": f'domain = "${{lower("{value}")}}"\n'}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_escaped_hcl_interpolation(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan({"examples/main.tf": f'value = "$${{{value}}}"\n'})
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_non_example_hostname_in_hcl_expression_comment(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan(
+            {
+                "examples/main.tf": (
+                    f'value = "${{lower(/* {value} */ "EXAMPLE.COM")}}"\n'
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_accepts_hcl_template_directive_traversals(self):
+        result = self.scan(
+            {"examples/main.tf": "value = <<EOT\n%{ if var.enabled }\nexample.com\n%{ endif }\nEOT\n"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_aws_secret_access_key_assignment_without_echoing_it(self):
         name = "_".join(("AWS", "SECRET", "ACCESS", "KEY"))
@@ -197,6 +267,21 @@ class PublicRepositoryTest(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_complete_example_is_documented_and_credential_free(self):
+        example = ROOT / "examples" / "complete"
+        self.assertTrue((example / "README.md").is_file())
+        self.assertTrue((example / "tests" / "basic.tftest.hcl").is_file())
+
+        text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in example.rglob("*.*")
+            if path.is_file()
+            and ".terraform" not in path.parts
+            and path.name != ".terraform.lock.hcl"
+        )
+        self.assertNotRegex(text, r'(?m)^\s*(?:provider|backend)\s+"')
+        self.assertNotIn("cfargotunnel.com", text.lower())
 
     def test_markdown_domain_check_rejects_suffix_spoof(self):
         self.assertFalse(markdown_uses_only_example_domains("customerexample.com"))

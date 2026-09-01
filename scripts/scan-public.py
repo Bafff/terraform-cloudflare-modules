@@ -40,6 +40,7 @@ HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
 CLOUDFLARE_ID = re.compile(r"\b[0-9a-fA-F]{32}\b")
 PROVIDER_BLOCK = re.compile(r"\bprovider\s+\"")
 BACKEND_BLOCK = re.compile(r"\bbackend\s+\"")
+HCL_HEREDOC = re.compile(r"<<-?\s*([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _is_permitted_domain(domain: str) -> bool:
@@ -49,6 +50,114 @@ def _is_permitted_domain(domain: str) -> bool:
 
 def _relative_path(root: pathlib.Path, path: pathlib.Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def _consume_hcl_string(line: str, start: int) -> tuple[str, int]:
+    literal: list[str] = []
+    index = start + 1
+    while index < len(line):
+        if line[index] == "\\" and index + 1 < len(line):
+            literal.append(line[index : index + 2])
+            index += 2
+        elif line[index] == '"':
+            return "".join(literal), index + 1
+        elif line.startswith("$${", index):
+            literal.append("${")
+            index += 3
+        elif line.startswith("%%{", index):
+            literal.append("%{")
+            index += 3
+        elif line.startswith(("${", "%{"), index):
+            nested_literals, index = _consume_hcl_expression(line, index + 2)
+            literal.append(nested_literals)
+        else:
+            literal.append(line[index])
+            index += 1
+    return "".join(literal), index
+
+
+def _consume_hcl_expression(line: str, start: int) -> tuple[str, int]:
+    nested_literals: list[str] = []
+    depth = 1
+    index = start
+    while index < len(line) and depth > 0:
+        if line[index] == '"':
+            literal, index = _consume_hcl_string(line, index)
+            nested_literals.append(literal)
+        elif line.startswith("/*", index):
+            comment: list[str] = []
+            comment_depth = 1
+            index += 2
+            while index < len(line) and comment_depth > 0:
+                if line.startswith("/*", index):
+                    comment_depth += 1
+                    index += 2
+                elif line.startswith("*/", index):
+                    comment_depth -= 1
+                    index += 2
+                else:
+                    comment.append(line[index])
+                    index += 1
+            nested_literals.append("".join(comment))
+        elif line[index] == "{":
+            depth += 1
+            index += 1
+        elif line[index] == "}":
+            depth -= 1
+            index += 1
+        else:
+            index += 1
+    return " ".join(nested_literals), index
+
+
+def _hcl_template_text(line: str) -> str:
+    literal: list[str] = []
+    index = 0
+    while index < len(line):
+        if line.startswith("$${", index):
+            literal.append("${")
+            index += 3
+        elif line.startswith("%%{", index):
+            literal.append("%{")
+            index += 3
+        elif line.startswith(("${", "%{"), index):
+            nested_literals, index = _consume_hcl_expression(line, index + 2)
+            literal.append(nested_literals)
+        else:
+            literal.append(line[index])
+            index += 1
+    return "".join(literal)
+
+
+def _hcl_hostname_source(line: str, block_comment_depth: int) -> tuple[str, int]:
+    literal: list[str] = []
+    index = 0
+    while index < len(line):
+        if block_comment_depth > 0:
+            if line.startswith("/*", index):
+                block_comment_depth += 1
+                index += 2
+            elif line.startswith("*/", index):
+                block_comment_depth -= 1
+                index += 2
+            else:
+                literal.append(line[index])
+                index += 1
+        elif line.startswith("/*", index):
+            block_comment_depth = 1
+            index += 2
+        elif line.startswith("//", index):
+            literal.append(line[index + 2 :])
+            break
+        elif line[index] == "#":
+            literal.append(line[index + 1 :])
+            break
+        elif line[index] == '"':
+            string_literal, index = _consume_hcl_string(line, index)
+            literal.append(string_literal)
+        else:
+            index += 1
+    return "".join(literal), block_comment_depth
 
 
 def _iter_regular_files(root: pathlib.Path):
@@ -86,6 +195,8 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
         text = content.decode("utf-8", errors="replace")
         in_example = pathlib.PurePosixPath(relative).parts[:1] == ("examples",)
         in_module = pathlib.PurePosixPath(relative).parts[:1] == ("modules",)
+        heredoc_terminator: str | None = None
+        block_comment_depth = 0
         for line_number, line in enumerate(text.splitlines(), start=1):
             if PRIVATE_KEY.search(line):
                 findings.append(Finding(relative, line_number, "private-key-marker"))
@@ -106,7 +217,20 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
 
             if in_example:
                 without_emails = EMAIL.sub("", line)
-                for match in HOSTNAME.finditer(without_emails):
+                hostname_source = without_emails
+                if path.suffix in {".tf", ".hcl"}:
+                    if heredoc_terminator is not None:
+                        hostname_source = _hcl_template_text(without_emails)
+                        if line.strip() == heredoc_terminator:
+                            heredoc_terminator = None
+                    else:
+                        hostname_source, block_comment_depth = _hcl_hostname_source(
+                            without_emails, block_comment_depth
+                        )
+                        heredoc = HCL_HEREDOC.search(line)
+                        if heredoc:
+                            heredoc_terminator = heredoc.group(1)
+                for match in HOSTNAME.finditer(hostname_source):
                     if not _is_permitted_domain(match.group(0)):
                         findings.append(Finding(relative, line_number, "non-example-hostname"))
                 for match in CLOUDFLARE_ID.finditer(line):

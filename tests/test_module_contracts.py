@@ -62,6 +62,12 @@ class ModuleContractTest(unittest.TestCase):
         self.assertIsNotNone(variable)
         self.assertRegex(variable.group("body"), r"(?m)^\s*sensitive\s*=\s*true\s*$")
 
+    def test_complete_example_wires_tunnel_dns_and_access_inputs(self):
+        text = (ROOT / "examples" / "complete" / "main.tf").read_text(encoding="utf-8")
+        self.assertRegex(text, r"(?m)^\s*content\s*=\s*local\.tunnel_dns_targets\[key\]\s*$")
+        self.assertRegex(text, r'(?s)module\s+"dns_records"\s*\{.*?\n\s*records\s*=\s*local\.dns_records\s*\n')
+        self.assertRegex(text, r'(?s)module\s+"access_applications"\s*\{.*?\n\s*applications\s*=\s*local\.applications\s*\n')
+
 
 if __name__ == "__main__":
     unittest.main()
