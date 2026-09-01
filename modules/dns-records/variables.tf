@@ -52,4 +52,12 @@ variable "records" {
     ])
     error_message = "MX records require priority; other supported record types must omit it."
   }
+
+  validation {
+    condition = alltrue([
+      for record in values(var.records) :
+      !record.proxied || (contains(["A", "AAAA", "CNAME"], record.type) && record.ttl == 1)
+    ])
+    error_message = "Proxied records must use type A, AAAA, or CNAME with automatic TTL 1."
+  }
 }

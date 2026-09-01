@@ -18,7 +18,7 @@ The caller configures the Cloudflare provider and the Terraform backend. This ch
 | `zone_id` | `string` | yes | Lowercase 32-character hexadecimal Cloudflare zone ID. |
 | `records` | `map(object)` | yes | Records keyed by a stable lowercase slug. Each record has `name`, `type`, `content`, `ttl`, and `proxied`; `priority`, `comment`, `settings`, and `tags` are optional. Supported types are `A`, `AAAA`, `CNAME`, `MX`, `NS`, `OPENPGPKEY`, `PTR`, and `TXT`. |
 
-`ttl` accepts `1` for automatic mode or `60` through `86400`. MX records require an integer `priority` from `0` through `65535`; other supported record types must omit it.
+`ttl` accepts `1` for automatic mode or `60` through `86400`. A proxied record must use type `A`, `AAAA`, or `CNAME` and automatic TTL `1`. MX records require an integer `priority` from `0` through `65535`; other supported record types must omit it.
 
 ## Output
 
@@ -38,7 +38,7 @@ module "dns_records" {
       name    = "example.com"
       type    = "A"
       content = "192.0.2.10"
-      ttl     = 3600
+      ttl     = 1
       proxied = true
     }
   }

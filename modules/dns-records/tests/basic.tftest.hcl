@@ -10,7 +10,7 @@ run "stable_typed_records" {
         name    = "example.com"
         type    = "A"
         content = "192.0.2.10"
-        ttl     = 3600
+        ttl     = 1
         proxied = true
         comment = "Synthetic public example"
         tags    = ["owner:example"]
@@ -29,7 +29,7 @@ run "stable_typed_records" {
         name    = "app.example.com"
         type    = "CNAME"
         content = "target.example.com"
-        ttl     = 3600
+        ttl     = 1
         proxied = true
       }
       mail-mx-primary = {
@@ -82,7 +82,7 @@ run "stable_typed_records" {
   }
 
   assert {
-    condition     = cloudflare_dns_record.this["apex-a"].zone_id == "00000000000000000000000000000000" && cloudflare_dns_record.this["apex-a"].proxied && cloudflare_dns_record.this["apex-a"].ttl == 3600
+    condition     = cloudflare_dns_record.this["apex-a"].zone_id == "00000000000000000000000000000000" && cloudflare_dns_record.this["apex-a"].proxied && cloudflare_dns_record.this["apex-a"].ttl == 1
     error_message = "The module must pass zone, proxy, and TTL fields without normalising them."
   }
 
@@ -178,6 +178,44 @@ run "rejects_priority_on_non_mx" {
         ttl      = 3600
         proxied  = false
         priority = 10
+      }
+    }
+  }
+
+  expect_failures = [var.records]
+}
+
+run "rejects_proxy_on_unsupported_record_type" {
+  command = plan
+
+  variables {
+    zone_id = "00000000000000000000000000000000"
+    records = {
+      spf-txt = {
+        name    = "example.com"
+        type    = "TXT"
+        content = "v=spf1 -all"
+        ttl     = 1
+        proxied = true
+      }
+    }
+  }
+
+  expect_failures = [var.records]
+}
+
+run "rejects_custom_ttl_on_proxied_record" {
+  command = plan
+
+  variables {
+    zone_id = "00000000000000000000000000000000"
+    records = {
+      apex-a = {
+        name    = "example.com"
+        type    = "A"
+        content = "192.0.2.10"
+        ttl     = 3600
+        proxied = true
       }
     }
   }

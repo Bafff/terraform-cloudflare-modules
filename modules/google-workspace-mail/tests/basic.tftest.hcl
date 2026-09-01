@@ -236,3 +236,39 @@ run "rejects_invalid_domain" {
 
   expect_failures = [var.domain]
 }
+
+run "rejects_domain_label_longer_than_63_characters" {
+  command = plan
+
+  variables {
+    zone_id = "00000000000000000000000000000000"
+    domain  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com"
+    mail = {
+      mx    = { mail-mx-primary = { content = "smtp.example.com", priority = 10, ttl = 1 } }
+      spf   = { content = "v=spf1 include:_spf.example.com ~all", ttl = 3600 }
+      dkim  = { selector = "google", content = "v=DKIM1; k=rsa; p=ZmFrZQ==", ttl = 3600 }
+      dmarc = { content = "v=DMARC1; p=none; rua=mailto:owner@example.com", ttl = 3600 }
+      bimi  = { selector = "default", content = "v=BIMI1; l=https://example.com/logo.svg", ttl = 3600 }
+    }
+  }
+
+  expect_failures = [var.domain]
+}
+
+run "rejects_domain_longer_than_253_characters" {
+  command = plan
+
+  variables {
+    zone_id = "00000000000000000000000000000000"
+    domain  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    mail = {
+      mx    = { mail-mx-primary = { content = "smtp.example.com", priority = 10, ttl = 1 } }
+      spf   = { content = "v=spf1 include:_spf.example.com ~all", ttl = 3600 }
+      dkim  = { selector = "google", content = "v=DKIM1; k=rsa; p=ZmFrZQ==", ttl = 3600 }
+      dmarc = { content = "v=DMARC1; p=none; rua=mailto:owner@example.com", ttl = 3600 }
+      bimi  = { selector = "default", content = "v=BIMI1; l=https://example.com/logo.svg", ttl = 3600 }
+    }
+  }
+
+  expect_failures = [var.domain]
+}

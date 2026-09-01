@@ -15,8 +15,8 @@ variable "domain" {
   nullable    = false
 
   validation {
-    condition     = can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$", var.domain))
-    error_message = "domain must be a lowercase fully qualified DNS name without a trailing dot."
+    condition     = length(var.domain) <= 253 && can(regex("^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", var.domain))
+    error_message = "domain must be a lowercase fully qualified DNS name no longer than 253 characters, with labels no longer than 63 characters and no trailing dot."
   }
 }
 
