@@ -216,11 +216,18 @@ class PublicRepositoryTest(unittest.TestCase):
                 "https://github.com/Bafff/terraform-cloudflare-modules.git",
             )
 
-    def test_repository_contract_has_no_remote_and_public_placeholders(self):
+    def test_repository_contract_has_expected_remote_and_public_placeholders(self):
         remote = subprocess.run(
-            ["git", "remote"], cwd=ROOT, text=True, capture_output=True, check=True
+            ["git", "remote", "get-url", "origin"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
         )
-        self.assertEqual(remote.stdout, "")
+        self.assertEqual(
+            remote.stdout.strip(),
+            "https://github.com/Bafff/terraform-cloudflare-modules.git",
+        )
         self.assertEqual((ROOT / ".terraform-version").read_text(encoding="utf-8").strip(), "1.16.0")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("example.com", readme)
