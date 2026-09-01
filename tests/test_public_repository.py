@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -51,6 +52,61 @@ class PublicRepositoryTest(unittest.TestCase):
                 text=True,
                 capture_output=True,
             )
+
+    def run_make_with_fake_terraform(self, *targets: str):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_path = pathlib.Path(directory)
+            fake_bin = temporary_path / "bin"
+            fake_bin.mkdir()
+            log = temporary_path / "terraform.log"
+            terraform = fake_bin / "terraform"
+            terraform.write_text(
+                "#!/bin/bash\nset -eu\nprintf '%s\\n' \"$*\" >> \"$FAKE_TERRAFORM_LOG\"\n",
+                encoding="utf-8",
+            )
+            terraform.chmod(0o700)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            environment["FAKE_TERRAFORM_LOG"] = str(log)
+
+            result = subprocess.run(
+                ["make", *targets],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+            return result, calls
+
+    def test_native_terraform_target_initializes_and_tests_every_module(self):
+        result, calls = self.run_make_with_fake_terraform("test-terraform")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        roots = [
+            "modules/access-applications",
+            "modules/cloudflare-tunnel",
+            "modules/dns-records",
+            "modules/google-workspace-mail",
+            "examples/complete",
+        ]
+        expected_calls = []
+        for root in roots:
+            expected_calls.extend(
+                [
+                    f"-chdir={root} init -backend=false -input=false",
+                    f"-chdir={root} test",
+                ]
+            )
+        self.assertEqual(calls, expected_calls)
+
+    def test_check_includes_native_terraform_suites(self):
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        check_line = next(
+            line for line in makefile.splitlines() if line.startswith("check:")
+        )
+
+        self.assertIn("test-terraform", check_line)
 
     def test_accepts_reserved_examples(self):
         result = self.scan(

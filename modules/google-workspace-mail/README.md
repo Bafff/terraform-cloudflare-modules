@@ -17,9 +17,11 @@ The caller configures the Cloudflare provider and the Terraform backend. This ch
 | --- | --- | --- | --- |
 | `zone_id` | `string` | yes | Lowercase 32-character hexadecimal Cloudflare zone ID. |
 | `domain` | `string` | yes | Lowercase fully qualified domain without a trailing dot, with labels no longer than 63 characters and a total length no longer than 253 characters. |
-| `mail` | `object` | yes | Verified MX, SPF, DKIM, DMARC, and BIMI data. MX entries use stable `mail-mx-*` keys and contain `content`, integer `priority`, and `ttl`. SPF and DMARC contain `content` and `ttl`. DKIM and BIMI also contain a lowercase `selector`. |
+| `mail` | `object` | yes | Verified MX, SPF, DKIM, DMARC, and BIMI data. MX entries use stable `mail-mx-*` keys and contain `content`, integer `priority`, and `ttl`. SPF and DMARC contain `content` and `ttl`. DKIM and BIMI also contain a lowercase DNS-label `selector` no longer than 63 characters. |
 
 Every TTL accepts `1` for automatic mode or `60` through `86400`. MX priority accepts integers from `0` through `65535`.
+
+The supplied domain and selectors must also keep every derived DKIM, DMARC, and BIMI owner name within the 253-character DNS limit.
 
 ## Output
 

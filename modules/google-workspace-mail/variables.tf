@@ -81,8 +81,17 @@ variable "mail" {
   validation {
     condition = alltrue([
       for selector in [var.mail.dkim.selector, var.mail.bimi.selector] :
-      can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", selector))
+      can(regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", selector))
     ])
-    error_message = "DKIM and BIMI selectors must be lowercase DNS labels."
+    error_message = "DKIM and BIMI selectors must be lowercase DNS labels no longer than 63 characters."
+  }
+
+  validation {
+    condition = alltrue([
+      length("_dmarc.${var.domain}") <= 253,
+      length("${var.mail.dkim.selector}._domainkey.${var.domain}") <= 253,
+      length("${var.mail.bimi.selector}._bimi.${var.domain}") <= 253,
+    ])
+    error_message = "The derived DKIM, DMARC, and BIMI DNS names must not exceed 253 characters."
   }
 }
