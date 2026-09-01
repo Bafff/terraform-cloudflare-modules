@@ -159,6 +159,27 @@ def _hcl_value_is_static_literal(value: str) -> bool:
     return exposes_literal
 
 
+def _hcl_template_contains_static_literal(value: str) -> bool:
+    saw_dynamic = False
+    index = 0
+    while index < len(value):
+        if value.startswith(("$${", "%%{"), index):
+            return True
+        if value.startswith(("${", "%{"), index):
+            saw_dynamic = True
+            end, _ = _scan_hcl_template_expression(value, index + 2)
+            if end <= index + 2 or value[end - 1 : end] != "}":
+                return True
+            if _hcl_expression_exposes_literal(
+                value[index + 2 : end - 1], 0
+            ):
+                return True
+            index = end
+            continue
+        return True
+    return not saw_dynamic
+
+
 def _scan_hcl_quoted_string(value: str, start: int) -> tuple[bool, int]:
     quote = value[start]
     if quote == "'":
@@ -567,7 +588,7 @@ def _json_contains_static_named_secret(value: object) -> bool:
 
 def _json_value_contains_static_literal(value: object) -> bool:
     if isinstance(value, str):
-        return _hcl_value_is_static_literal(json.dumps(value))
+        return _hcl_template_contains_static_literal(value)
     if isinstance(value, JsonObject):
         return any(
             _json_value_contains_static_literal(child)
@@ -582,6 +603,31 @@ def _json_value_contains_static_literal(value: object) -> bool:
     return value is not None
 
 
+def _iter_json_strings(value: object):
+    if isinstance(value, str):
+        yield value, True
+    elif isinstance(value, JsonObject):
+        for key, child in value.pairs:
+            yield key, False
+            yield from _iter_json_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_json_strings(child)
+
+
+def _decoded_json_source(
+    path: pathlib.Path, decoded: str, is_expression: bool
+) -> str:
+    if not is_expression or not _is_hcl_path(path):
+        return decoded
+    state = HclHostnameState(in_heredoc=True)
+    sources = [
+        _hcl_hostname_source(line, state)[0]
+        for line in decoded.splitlines()
+    ]
+    return " ".join(sources)
+
+
 def _hcl_hostname_source(
     line: str, state: HclHostnameState
 ) -> tuple[str, tuple[str, bool] | None, bool]:
@@ -592,6 +638,7 @@ def _hcl_hostname_source(
     while index < len(line):
         if state.block_comment_depth > 0:
             if line.startswith("/*", index):
+                literal.append(" ")
                 state.block_comment_depth += 1
                 index += 2
             elif line.startswith("*/", index):
@@ -604,6 +651,7 @@ def _hcl_hostname_source(
                 index += 1
         elif state.expression_comment_depth > 0:
             if line.startswith("/*", index):
+                literal.append(" ")
                 state.expression_comment_depth += 1
                 index += 2
             elif line.startswith("*/", index):
@@ -625,6 +673,7 @@ def _hcl_hostname_source(
                 literal.append("%{")
                 index += 3
             elif line.startswith(("${", "%{"), index):
+                literal.append(" ")
                 state.expression_string_return_depths.append(
                     state.expression_depth
                 )
@@ -664,6 +713,7 @@ def _hcl_hostname_source(
                 index += 1
             elif line[index] == "}":
                 state.expression_depth -= 1
+                expression_ended = state.expression_depth == 0
                 if (
                     state.expression_string_return_depths
                     and state.expression_depth
@@ -671,6 +721,9 @@ def _hcl_hostname_source(
                 ):
                     state.expression_string_return_depths.pop()
                     state.expression_string = True
+                    expression_ended = True
+                if expression_ended:
+                    literal.append(" ")
                 index += 1
             else:
                 index += 1
@@ -682,6 +735,7 @@ def _hcl_hostname_source(
                 literal.append("%{")
                 index += 3
             elif line.startswith(("${", "%{"), index):
+                literal.append(" ")
                 state.expression_depth = 1
                 index += 2
             else:
@@ -698,6 +752,7 @@ def _hcl_hostname_source(
                 literal.append("%{")
                 index += 3
             elif line.startswith(("${", "%{"), index):
+                literal.append(" ")
                 state.expression_depth = 1
                 index += 2
             elif line[index] == '"':
@@ -766,6 +821,7 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
             continue
         text = content.decode("utf-8", errors="replace")
         json_was_parsed = False
+        decoded_json_sources: tuple[str, ...] = ()
         if path.suffix == ".json":
             try:
                 json_value = json.loads(
@@ -778,6 +834,30 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                 json_was_parsed = True
                 if _json_contains_static_named_secret(json_value):
                     findings.append(Finding(relative, 0, "named-secret-format"))
+                decoded_json_sources = tuple(
+                    _decoded_json_source(path, decoded, is_expression)
+                    for decoded, is_expression in _iter_json_strings(
+                        json_value
+                    )
+                )
+                for decoded_source in decoded_json_sources:
+                    for pattern, rule in (
+                        (PRIVATE_KEY, "private-key-marker"),
+                        (AWS_ACCESS_KEY, "aws-secret-format"),
+                        (GITHUB_TOKEN, "github-secret-format"),
+                        (AGE_SECRET_KEY, "age-secret-format"),
+                    ):
+                        if pattern.search(decoded_source):
+                            findings.append(Finding(relative, 0, rule))
+                    for match in EMAIL.finditer(decoded_source):
+                        if not _is_permitted_domain(match.group(1)):
+                            findings.append(
+                                Finding(
+                                    relative,
+                                    0,
+                                    "non-public-email-domain",
+                                )
+                            )
         if path.suffix != ".json" or not json_was_parsed:
             for assignment_pattern, assignment_rule in (
                 (
@@ -806,17 +886,47 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
         in_metadata_scope = in_example or (
             in_module and _is_hcl_path(path)
         )
+        if in_metadata_scope and json_was_parsed:
+            for metadata_source in decoded_json_sources:
+                hostname_source = EMAIL.sub("", metadata_source)
+                hostname_source = ASSET_PATH_EXTENSION.sub(
+                    r"/\1", hostname_source
+                )
+                for match in HOSTNAME.finditer(hostname_source):
+                    if not _is_permitted_domain(match.group(0)):
+                        findings.append(
+                            Finding(relative, 0, "non-example-hostname")
+                        )
+                for match in CLOUDFLARE_ID.finditer(metadata_source):
+                    if set(match.group(0)) != {"0"}:
+                        findings.append(
+                            Finding(
+                                relative,
+                                0,
+                                "non-sentinel-cloudflare-id",
+                            )
+                        )
         heredoc_stack: list[tuple[str, bool, HclHostnameState]] = []
         hcl_hostname_state = HclHostnameState()
         for line_number, line in enumerate(text.splitlines(), start=1):
+            if json_was_parsed:
+                continue
             if PRIVATE_KEY.search(line):
-                findings.append(Finding(relative, line_number, "private-key-marker"))
+                findings.append(
+                    Finding(relative, line_number, "private-key-marker")
+                )
             if AWS_ACCESS_KEY.search(line):
-                findings.append(Finding(relative, line_number, "aws-secret-format"))
+                findings.append(
+                    Finding(relative, line_number, "aws-secret-format")
+                )
             if GITHUB_TOKEN.search(line):
-                findings.append(Finding(relative, line_number, "github-secret-format"))
+                findings.append(
+                    Finding(relative, line_number, "github-secret-format")
+                )
             if AGE_SECRET_KEY.search(line):
-                findings.append(Finding(relative, line_number, "age-secret-format"))
+                findings.append(
+                    Finding(relative, line_number, "age-secret-format")
+                )
 
             for match in EMAIL.finditer(line):
                 if not _is_permitted_domain(match.group(1)):

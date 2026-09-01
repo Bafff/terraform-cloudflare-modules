@@ -322,8 +322,14 @@ class PublicRepositoryTest(unittest.TestCase):
         suffix = "invalid"
         for label, content in {
             "ordinary": f'/*{prefix}*/value = "{suffix}"\n',
+            "ordinary-nested-comment": (
+                f"/*{prefix}/**/{suffix}*/\n"
+            ),
             "expression": (
                 f'value = "${{lower(/*{prefix}*/"{suffix}")}}"\n'
+            ),
+            "expression-nested-comment": (
+                f'value = "${{lower(/*{prefix}/**/{suffix}*/ var.x)}}"\n'
             ),
         }.items():
             with self.subTest(label=label):
@@ -395,6 +401,148 @@ class PublicRepositoryTest(unittest.TestCase):
                 self.assertNotIn(
                     image_like_hostname, result.stdout + result.stderr
                 )
+
+    def test_rejects_decoded_metadata_in_terraform_json(self):
+        hostname = ".".join(("private", "invalid"))
+        escaped_hostname = "private\\u002einvalid"
+        escaped_email = "owner\\u0040private\\u002einvalid"
+        cloudflare_id = "1" * 32
+        escaped_cloudflare_id = "\\u0031" * 32
+        cases = {
+            "modules/example/main.tf.json": (
+                f'{{"hostname":"{escaped_hostname}"}}'
+            ),
+            "modules/example/terraform.tfvars.json": (
+                f'{{"hostname":"{escaped_hostname}"}}'
+            ),
+            "modules/example/terraform.auto.tfvars.json": (
+                f'{{"hostname":"{escaped_hostname}"}}'
+            ),
+            "modules/example/tests/basic.tftest.json": (
+                f'{{"hostname":"{escaped_hostname}"}}'
+            ),
+            "modules/example/tests/defaults.tfmock.json": (
+                f'{{"hostname":"{escaped_hostname}"}}'
+            ),
+            "modules/example/tests/key.tftest.json": (
+                f'{{"{escaped_hostname}":true}}'
+            ),
+            "modules/example/tests/email.tftest.json": (
+                f'{{"email":"{escaped_email}"}}'
+            ),
+            "modules/example/tests/id.tftest.json": (
+                f'{{"id":"{escaped_cloudflare_id}"}}'
+            ),
+        }
+        for path, content in cases.items():
+            with self.subTest(path=path):
+                result = self.scan({path: content})
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(
+                    hostname, result.stdout + result.stderr
+                )
+                self.assertNotIn(
+                    cloudflare_id, result.stdout + result.stderr
+                )
+
+    def test_dynamic_template_boundaries_do_not_merge_metadata(self):
+        hostname_template = 'private${format(".invalid")}'
+        email_template = 'owner@private${format(".invalid")}'
+        id_template = ("1" * 16) + '${format("' + ("1" * 16) + '")}'
+        github_template = 'ghp_${format("' + ("A" * 24) + '")}'
+        aws_template = 'AKIA${format("' + ("A" * 16) + '")}'
+        age_template = (
+            'AGE-SECRET-KEY-1${format("' + ("A" * 24) + '")}'
+        )
+        private_key_template = (
+            '-----BEGIN ${format("PRIVATE KEY-----")}'
+        )
+        cases = {
+            "modules/example/main.tf": (
+                f'hostname = "{hostname_template}"\n'
+                f'email = "{email_template}"\n'
+                f'id = "{id_template}"\n'
+            ),
+            "modules/example/main.tf.json": json.dumps(
+                {
+                    "hostname": hostname_template,
+                    "email": email_template,
+                    "id": id_template,
+                    "github": github_template,
+                    "aws": aws_template,
+                    "age": age_template,
+                    "private_key": private_key_template,
+                }
+            ),
+        }
+        for path, content in cases.items():
+            with self.subTest(path=path):
+                result = self.scan({path: content})
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_quoted_arguments_in_terraform_json_templates(self):
+        traversal = ".".join(("var", "private", "invalid"))
+        value = f'${{format("%s", {traversal})}}'
+        paths = (
+            "modules/example/main.tf.json",
+            "modules/example/terraform.tfvars.json",
+            "modules/example/terraform.auto.tfvars.json",
+            "modules/example/tests/basic.tftest.json",
+            "modules/example/tests/defaults.tfmock.json",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                result = self.scan(
+                    {path: json.dumps({"value": value})}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_decoded_secret_signatures_in_json(self):
+        values = {
+            "github": "ghp_" + ("A" * 24),
+            "aws": "AKIA" + ("A" * 16),
+            "age": "AGE-SECRET-KEY-1" + ("A" * 24),
+            "private-key": ("-" * 5) + "BEGIN PRIVATE KEY" + ("-" * 5),
+        }
+        for label, value in values.items():
+            with self.subTest(label=label):
+                escaped = f"\\u{ord(value[0]):04x}{value[1:]}"
+                result = self.scan(
+                    {
+                        "modules/example/main.tf.json": (
+                            f'{{"value":"{escaped}"}}'
+                        )
+                    }
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_rejects_decoded_email_in_general_json(self):
+        email = "owner@" + ".".join(("private", "invalid"))
+        escaped = "owner\\u0040private\\u002einvalid"
+        result = self.scan(
+            {"config.json": f'{{"contact":"{escaped}"}}'}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(email, result.stdout + result.stderr)
+
+    def test_scans_valid_json_metadata_once(self):
+        hostname = ".".join(("private", "invalid"))
+        result = self.scan(
+            {
+                "modules/example/main.tf.json": json.dumps(
+                    {"hostname": hostname}
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 1)
+        findings = [
+            line
+            for line in result.stdout.splitlines()
+            if line.endswith(":non-example-hostname")
+        ]
+        self.assertEqual(len(findings), 1, findings)
+        self.assertNotIn(hostname, result.stdout + result.stderr)
 
     def test_rejects_non_sentinel_cloudflare_id_in_module_hcl(self):
         value = "1" * 32
@@ -783,12 +931,16 @@ class PublicRepositoryTest(unittest.TestCase):
     def test_accepts_dynamic_and_null_terraform_json_secret_values(self):
         first_name = "_".join(("github", "token"))
         second_name = "_".join(("cloudflare", "token"))
+        third_name = "_".join(("cloudflare", "api", "key"))
         result = self.scan(
             {
                 "modules/example/main.tf.json": json.dumps(
                     {
                         first_name: "${var.token}",
                         second_name: None,
+                        third_name: (
+                            '${lookup(var.tokens, "cloudflare")}'
+                        ),
                     }
                 )
             }
