@@ -56,6 +56,17 @@ variable "records" {
   validation {
     condition = alltrue([
       for record in values(var.records) :
+      record.name == "@" || (
+        length(record.name) <= 253 &&
+        alltrue([for label in split(".", record.name) : length(label) > 0 && length(label) <= 63])
+      )
+    ])
+    error_message = "Record names must be @ or DNS owner names no longer than 253 characters, with labels from 1 through 63 characters."
+  }
+
+  validation {
+    condition = alltrue([
+      for record in values(var.records) :
       !record.proxied || (contains(["A", "AAAA", "CNAME"], record.type) && record.ttl == 1)
     ])
     error_message = "Proxied records must use type A, AAAA, or CNAME with automatic TTL 1."

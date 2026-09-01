@@ -16,7 +16,7 @@ SCANNER = ROOT / "scripts" / "scan-public.py"
 INSTALLER = ROOT / "scripts" / "setup-ci-tools.sh"
 MARKDOWN_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 MARKDOWN_HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
-MARKDOWN_URL = re.compile(r"(?:https?:)?//[^\s<>\"'`]+", re.IGNORECASE)
+MARKDOWN_URL = re.compile(r"(?:https?:)?//[^\s<>\"'`)\]]+", re.IGNORECASE)
 MARKDOWN_ASSET_EXTENSION = re.compile(
     r"(?i)\.(?:gif|ico|jpe?g|png|svg|webp)(?=/|$)"
 )
@@ -473,6 +473,13 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertTrue(
             markdown_uses_only_example_domains(
                 "owner@example.com https://example.com/logo.svg"
+            )
+        )
+
+    def test_markdown_domain_check_accepts_inline_example_asset_link(self):
+        self.assertTrue(
+            markdown_uses_only_example_domains(
+                "[logo](https://example.com/logo.svg)"
             )
         )
 

@@ -222,3 +222,41 @@ run "rejects_custom_ttl_on_proxied_record" {
 
   expect_failures = [var.records]
 }
+
+run "rejects_record_name_label_longer_than_63_characters" {
+  command = plan
+
+  variables {
+    zone_id = "00000000000000000000000000000000"
+    records = {
+      oversized-label = {
+        name    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com"
+        type    = "TXT"
+        content = "synthetic"
+        ttl     = 3600
+        proxied = false
+      }
+    }
+  }
+
+  expect_failures = [var.records]
+}
+
+run "rejects_record_name_longer_than_253_characters" {
+  command = plan
+
+  variables {
+    zone_id = "00000000000000000000000000000000"
+    records = {
+      oversized-name = {
+        name    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        type    = "TXT"
+        content = "synthetic"
+        ttl     = 3600
+        proxied = false
+      }
+    }
+  }
+
+  expect_failures = [var.records]
+}
