@@ -17,6 +17,9 @@ INSTALLER = ROOT / "scripts" / "setup-ci-tools.sh"
 MARKDOWN_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 MARKDOWN_HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
 MARKDOWN_URL = re.compile(r"(?:https?:)?//[^\s<>\"'`]+", re.IGNORECASE)
+MARKDOWN_ASSET_FILENAME = re.compile(
+    r"(?i)(?:^|/)[^/?#]+\.(?:gif|ico|jpe?g|png|svg|webp)(?=/|$)"
+)
 
 
 def is_example_domain(domain: str) -> bool:
@@ -25,16 +28,36 @@ def is_example_domain(domain: str) -> bool:
 
 
 def markdown_uses_only_example_domains(text: str) -> bool:
+    url_residues = []
     for match in MARKDOWN_URL.finditer(text):
-        hostname = urllib.parse.urlsplit(match.group(0)).hostname
+        parsed = urllib.parse.urlsplit(match.group(0))
+        hostname = parsed.hostname
         if hostname is None or not is_example_domain(hostname):
             return False
+        path = MARKDOWN_ASSET_FILENAME.sub(
+            "/", urllib.parse.unquote(parsed.path)
+        )
+        url_residues.append(
+            " ".join(
+                filter(
+                    None,
+                    (
+                        urllib.parse.unquote(parsed.username or ""),
+                        urllib.parse.unquote(parsed.password or ""),
+                        path,
+                        urllib.parse.unquote_plus(parsed.query),
+                        urllib.parse.unquote(parsed.fragment),
+                    ),
+                )
+            )
+        )
     without_urls = MARKDOWN_URL.sub("", text)
+    text_to_check = "\n".join((without_urls, *url_residues))
 
-    for match in MARKDOWN_EMAIL.finditer(without_urls):
+    for match in MARKDOWN_EMAIL.finditer(text_to_check):
         if not is_example_domain(match.group(1)):
             return False
-    without_emails = MARKDOWN_EMAIL.sub("", without_urls)
+    without_emails = MARKDOWN_EMAIL.sub("", text_to_check)
 
     return all(is_example_domain(match.group(0)) for match in MARKDOWN_HOSTNAME.finditer(without_emails))
 
@@ -385,6 +408,38 @@ class PublicRepositoryTest(unittest.TestCase):
         forbidden = ".".join(("private", "invalid"))
         self.assertFalse(
             markdown_uses_only_example_domains(f"https://{forbidden}/logo.svg")
+        )
+
+    def test_markdown_domain_check_rejects_non_example_url_userinfo(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(
+                f"https://{forbidden}@example.com/logo.svg"
+            )
+        )
+
+    def test_markdown_domain_check_rejects_non_example_url_path(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(
+                f"https://example.com/customers/{forbidden}/logo.svg"
+            )
+        )
+
+    def test_markdown_domain_check_rejects_non_example_url_query(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(
+                f"https://example.com/logo.svg?origin={forbidden}"
+            )
+        )
+
+    def test_markdown_domain_check_rejects_encoded_non_example_url_path(self):
+        forbidden = "%2E".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(
+                f"https://example.com/customers/{forbidden}/logo.svg"
+            )
         )
 
     def test_markdown_domain_check_rejects_uppercase_non_example_url_authority(self):
