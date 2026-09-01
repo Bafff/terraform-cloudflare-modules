@@ -14,8 +14,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCANNER = ROOT / "scripts" / "scan-public.py"
 INSTALLER = ROOT / "scripts" / "setup-ci-tools.sh"
 MARKDOWN_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
-MARKDOWN_HOSTNAME = re.compile(r"(?<!/)\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
-MARKDOWN_URL = re.compile(r"https?://[^\s<>\"'`]+")
+MARKDOWN_HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+MARKDOWN_URL = re.compile(r"(?:https?:)?//[^\s<>\"'`]+", re.IGNORECASE)
 
 
 def is_example_domain(domain: str) -> bool:
@@ -200,6 +200,25 @@ class PublicRepositoryTest(unittest.TestCase):
         forbidden = ".".join(("private", "invalid"))
         self.assertFalse(
             markdown_uses_only_example_domains(f"https://{forbidden}/logo.svg")
+        )
+
+    def test_markdown_domain_check_rejects_uppercase_non_example_url_authority(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(f"HTTPS://{forbidden}/logo.svg")
+        )
+
+    def test_markdown_domain_check_rejects_scheme_relative_non_example_url_authority(self):
+        forbidden = ".".join(("private", "invalid"))
+        self.assertFalse(
+            markdown_uses_only_example_domains(f"//{forbidden}/logo.svg")
+        )
+
+    def test_markdown_domain_check_accepts_uppercase_and_scheme_relative_example_urls(self):
+        self.assertTrue(
+            markdown_uses_only_example_domains(
+                "HTTPS://example.com/logo.svg //docs.example.com/logo.svg"
+            )
         )
 
     def test_markdown_domain_check_accepts_example_email_and_url(self):
