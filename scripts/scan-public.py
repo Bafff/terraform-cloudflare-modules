@@ -18,6 +18,15 @@ class Finding:
     rule: str
 
 
+@dataclasses.dataclass
+class HclHostnameState:
+    block_comment_depth: int = 0
+    in_string: bool = False
+    expression_depth: int = 0
+    expression_comment_depth: int = 0
+    expression_string: bool = False
+
+
 FILENAME_RULES = (
     ("*.tfstate*", "forbidden-state-file"),
     ("*.tfplan*", "forbidden-plan-file"),
@@ -129,22 +138,82 @@ def _hcl_template_text(line: str) -> str:
     return "".join(literal)
 
 
-def _hcl_hostname_source(line: str, block_comment_depth: int) -> tuple[str, int]:
+def _hcl_hostname_source(line: str, state: HclHostnameState) -> str:
     literal: list[str] = []
     index = 0
     while index < len(line):
-        if block_comment_depth > 0:
+        if state.block_comment_depth > 0:
             if line.startswith("/*", index):
-                block_comment_depth += 1
+                state.block_comment_depth += 1
                 index += 2
             elif line.startswith("*/", index):
-                block_comment_depth -= 1
+                state.block_comment_depth -= 1
                 index += 2
             else:
                 literal.append(line[index])
                 index += 1
+        elif state.expression_comment_depth > 0:
+            if line.startswith("/*", index):
+                state.expression_comment_depth += 1
+                index += 2
+            elif line.startswith("*/", index):
+                state.expression_comment_depth -= 1
+                index += 2
+            else:
+                literal.append(line[index])
+                index += 1
+        elif state.expression_string:
+            if line[index] == "\\" and index + 1 < len(line):
+                literal.append(line[index : index + 2])
+                index += 2
+            elif line[index] == '"':
+                state.expression_string = False
+                index += 1
+            else:
+                literal.append(line[index])
+                index += 1
+        elif state.expression_depth > 0:
+            if line.startswith("/*", index):
+                state.expression_comment_depth = 1
+                index += 2
+            elif line.startswith("//", index):
+                literal.append(line[index + 2 :])
+                break
+            elif line[index] == "#":
+                literal.append(line[index + 1 :])
+                break
+            elif line[index] == '"':
+                state.expression_string = True
+                index += 1
+            elif line[index] == "{":
+                state.expression_depth += 1
+                index += 1
+            elif line[index] == "}":
+                state.expression_depth -= 1
+                index += 1
+            else:
+                index += 1
+        elif state.in_string:
+            if line[index] == "\\" and index + 1 < len(line):
+                literal.append(line[index : index + 2])
+                index += 2
+            elif line.startswith("$${", index):
+                literal.append("${")
+                index += 3
+            elif line.startswith("%%{", index):
+                literal.append("%{")
+                index += 3
+            elif line.startswith(("${", "%{"), index):
+                state.expression_depth = 1
+                index += 2
+            elif line[index] == '"':
+                state.in_string = False
+                index += 1
+            else:
+                literal.append(line[index])
+                index += 1
         elif line.startswith("/*", index):
-            block_comment_depth = 1
+            state.block_comment_depth = 1
             index += 2
         elif line.startswith("//", index):
             literal.append(line[index + 2 :])
@@ -153,11 +222,11 @@ def _hcl_hostname_source(line: str, block_comment_depth: int) -> tuple[str, int]
             literal.append(line[index + 1 :])
             break
         elif line[index] == '"':
-            string_literal, index = _consume_hcl_string(line, index)
-            literal.append(string_literal)
+            state.in_string = True
+            index += 1
         else:
             index += 1
-    return "".join(literal), block_comment_depth
+    return "".join(literal)
 
 
 def _iter_regular_files(root: pathlib.Path):
@@ -196,7 +265,7 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
         in_example = pathlib.PurePosixPath(relative).parts[:1] == ("examples",)
         in_module = pathlib.PurePosixPath(relative).parts[:1] == ("modules",)
         heredoc_terminator: str | None = None
-        block_comment_depth = 0
+        hcl_hostname_state = HclHostnameState()
         for line_number, line in enumerate(text.splitlines(), start=1):
             if PRIVATE_KEY.search(line):
                 findings.append(Finding(relative, line_number, "private-key-marker"))
@@ -224,8 +293,8 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                         if line.strip() == heredoc_terminator:
                             heredoc_terminator = None
                     else:
-                        hostname_source, block_comment_depth = _hcl_hostname_source(
-                            without_emails, block_comment_depth
+                        hostname_source = _hcl_hostname_source(
+                            without_emails, hcl_hostname_state
                         )
                         heredoc = HCL_HEREDOC.search(line)
                         if heredoc:

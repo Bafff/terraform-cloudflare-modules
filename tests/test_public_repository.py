@@ -254,6 +254,20 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_rejects_non_example_hostname_in_multiline_hcl_expression_comment(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan(
+            {
+                "examples/main.tf": (
+                    'value = "${lower(/*\n'
+                    f"{value}\n"
+                    '*/ "EXAMPLE.COM")}"\n'
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
     def test_accepts_hcl_template_directive_traversals(self):
         result = self.scan(
             {"examples/main.tf": "value = <<EOT\n%{ if var.enabled }\nexample.com\n%{ endif }\nEOT\n"}

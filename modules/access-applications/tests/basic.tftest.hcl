@@ -178,6 +178,26 @@ run "rejects_email_with_empty_local_atom" {
   expect_failures = [var.allowed_emails]
 }
 
+run "rejects_email_with_local_part_longer_than_64_characters" {
+  command = plan
+
+  variables {
+    allowed_emails = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com"]
+  }
+
+  expect_failures = [var.allowed_emails]
+}
+
+run "rejects_email_longer_than_254_characters" {
+  command = plan
+
+  variables {
+    allowed_emails = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com"]
+  }
+
+  expect_failures = [var.allowed_emails]
+}
+
 run "rejects_empty_email_set" {
   command = plan
 

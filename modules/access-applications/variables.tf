@@ -34,9 +34,11 @@ variable "allowed_emails" {
   validation {
     condition = alltrue([
       for address in var.allowed_emails :
+      length(address) <= 254 &&
+      length(split("@", address)[0]) <= 64 &&
       can(regex("^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$", address))
     ])
-    error_message = "Every allowed_emails value must use valid email address syntax with a fully qualified domain."
+    error_message = "Every allowed_emails value must use valid email address syntax, a local part no longer than 64 characters, a total length no longer than 254 characters, and a fully qualified domain."
   }
 }
 

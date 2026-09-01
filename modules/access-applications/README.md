@@ -21,7 +21,7 @@ The caller configures the Cloudflare provider and the Terraform backend. This ch
 | `applications` | `map(object({ name = string, domain = string }))` | yes | Non-empty application map keyed by stable lowercase slugs. Domains must be lowercase fully qualified hostnames without paths or trailing dots. |
 | `session_duration` | `string` | yes | Exact duration `730h`. The module applies it to the reusable policy and every application. |
 
-The module copies each supplied email address into one policy rule. It does not normalise, expand, or invent addresses. The hostname validation accepts public fully qualified domains and does not restrict callers to `example.com`.
+The module copies each supplied email address into one policy rule. It does not normalise, expand, or invent addresses. An address must have a local part no longer than 64 characters and a total length no longer than 254 characters. The hostname validation accepts public fully qualified domains and does not restrict callers to `example.com`.
 
 ## Outputs
 
