@@ -208,6 +208,21 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_non_indented_hcl_heredoc_requires_unindented_terminator(self):
+        value = ".".join(("private", "invalid"))
+        result = self.scan(
+            {
+                "examples/main.tf": (
+                    "value = <<EOT\n"
+                    "  EOT\n"
+                    f"{value}\n"
+                    "EOT\n"
+                )
+            }
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(value, result.stdout + result.stderr)
+
     def test_rejects_non_example_hostname_in_hcl_comment(self):
         value = ".".join(("private", "invalid"))
         result = self.scan({"examples/main.tf": f"# {value}\n"})

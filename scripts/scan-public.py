@@ -49,7 +49,9 @@ HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
 CLOUDFLARE_ID = re.compile(r"\b[0-9a-fA-F]{32}\b")
 PROVIDER_BLOCK = re.compile(r"\bprovider\s+\"")
 BACKEND_BLOCK = re.compile(r"\bbackend\s+\"")
-HCL_HEREDOC = re.compile(r"<<-?\s*([A-Za-z_][A-Za-z0-9_]*)")
+HCL_HEREDOC = re.compile(
+    r"<<(?P<allows_indent>-?)\s*(?P<terminator>[A-Za-z_][A-Za-z0-9_]*)"
+)
 
 
 def _is_permitted_domain(domain: str) -> bool:
@@ -264,7 +266,7 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
         text = content.decode("utf-8", errors="replace")
         in_example = pathlib.PurePosixPath(relative).parts[:1] == ("examples",)
         in_module = pathlib.PurePosixPath(relative).parts[:1] == ("modules",)
-        heredoc_terminator: str | None = None
+        heredoc: tuple[str, bool] | None = None
         hcl_hostname_state = HclHostnameState()
         for line_number, line in enumerate(text.splitlines(), start=1):
             if PRIVATE_KEY.search(line):
@@ -288,17 +290,26 @@ def scan_path(root: pathlib.Path) -> tuple[Finding, ...]:
                 without_emails = EMAIL.sub("", line)
                 hostname_source = without_emails
                 if path.suffix in {".tf", ".hcl"}:
-                    if heredoc_terminator is not None:
+                    if heredoc is not None:
                         hostname_source = _hcl_template_text(without_emails)
-                        if line.strip() == heredoc_terminator:
-                            heredoc_terminator = None
+                        terminator, allows_indent = heredoc
+                        is_terminator = (
+                            line.lstrip(" \t") == terminator
+                            if allows_indent
+                            else line == terminator
+                        )
+                        if is_terminator:
+                            heredoc = None
                     else:
                         hostname_source = _hcl_hostname_source(
                             without_emails, hcl_hostname_state
                         )
-                        heredoc = HCL_HEREDOC.search(line)
-                        if heredoc:
-                            heredoc_terminator = heredoc.group(1)
+                        heredoc_match = HCL_HEREDOC.search(line)
+                        if heredoc_match:
+                            heredoc = (
+                                heredoc_match.group("terminator"),
+                                heredoc_match.group("allows_indent") == "-",
+                            )
                 for match in HOSTNAME.finditer(hostname_source):
                     if not _is_permitted_domain(match.group(0)):
                         findings.append(Finding(relative, line_number, "non-example-hostname"))
