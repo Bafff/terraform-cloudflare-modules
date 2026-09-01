@@ -41,8 +41,8 @@ run "derived_protected_mail_records" {
   }
 
   assert {
-    condition     = cloudflare_dns_record.this["mail-mx-primary"].name == "example.com" && cloudflare_dns_record.this["mail-mx-primary"].type == "MX" && cloudflare_dns_record.this["mail-mx-primary"].priority == 10
-    error_message = "MX name, type, and imported priority must be preserved."
+    condition     = cloudflare_dns_record.this["mail-mx-primary"].name == "example.com" && cloudflare_dns_record.this["mail-mx-primary"].type == "MX" && cloudflare_dns_record.this["mail-mx-primary"].content == "smtp.example.com" && cloudflare_dns_record.this["mail-mx-primary"].priority == 10
+    error_message = "MX name, type, imported content, and priority must be preserved."
   }
 
   assert {

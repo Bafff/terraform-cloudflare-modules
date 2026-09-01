@@ -17,9 +17,9 @@ class ModuleContractTest(unittest.TestCase):
     def test_mail_record_resource_has_prevent_destroy(self):
         text = (MODULES / "google-workspace-mail" / "main.tf").read_text(encoding="utf-8")
         resource = re.search(
-            r'resource\s+"cloudflare_dns_record"\s+"this"\s*\{(?P<body>.*)\n\}',
+            r'^resource\s+"cloudflare_dns_record"\s+"this"\s*\{(?P<body>.*?)^\}',
             text,
-            re.DOTALL,
+            re.DOTALL | re.MULTILINE,
         )
         self.assertIsNotNone(resource)
         self.assertRegex(resource.group("body"), r"lifecycle\s*\{[^}]*prevent_destroy\s*=\s*true")

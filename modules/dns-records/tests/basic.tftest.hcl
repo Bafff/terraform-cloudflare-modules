@@ -146,7 +146,7 @@ run "rejects_invalid_record_fields" {
   expect_failures = [var.records]
 }
 
-run "requires_mx_priority_and_forbids_other_priorities" {
+run "requires_mx_priority" {
   command = plan
 
   variables {
@@ -158,6 +158,26 @@ run "requires_mx_priority_and_forbids_other_priorities" {
         content = "smtp.example.com"
         ttl     = 3600
         proxied = false
+      }
+    }
+  }
+
+  expect_failures = [var.records]
+}
+
+run "rejects_priority_on_non_mx" {
+  command = plan
+
+  variables {
+    zone_id = "00000000000000000000000000000000"
+    records = {
+      apex-a = {
+        name     = "example.com"
+        type     = "A"
+        content  = "192.0.2.10"
+        ttl      = 3600
+        proxied  = false
+        priority = 10
       }
     }
   }

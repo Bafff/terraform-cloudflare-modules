@@ -1,6 +1,7 @@
 import hashlib
 import json
 import pathlib
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -130,7 +131,49 @@ class PublicRepositoryTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("example.com", readme)
         self.assertIn("macOS ARM64 is for local operator work; Linux AMD64 is for CI.", readme)
-        self.assertIn("Native Windows support is explicitly deferred.", readme)
+        self.assertIn(
+            "Native Windows support is explicitly deferred because it adds maintenance work without a current use case.",
+            readme,
+        )
+
+    def test_module_documentation_is_public_and_credential_free(self):
+        module_names = ("dns-records", "google-workspace-mail")
+        for module_name in module_names:
+            readme = ROOT / "modules" / module_name / "README.md"
+            self.assertTrue(readme.is_file(), readme)
+
+        provider_or_backend = re.compile(r'(?m)^\s*(?:provider|backend)\s+"')
+        for path in (ROOT / "modules").rglob("*.tf"):
+            self.assertIsNone(
+                provider_or_backend.search(path.read_text(encoding="utf-8")),
+                path,
+            )
+
+        private_repository_name = "-".join(("cloudflare", "infrastructure"))
+        hostname = re.compile(r"(?<!/)\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+        email = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+        cloudflare_id = re.compile(r"\b[0-9a-fA-F]{32}\b")
+        for path in ROOT.rglob("*.md"):
+            if ".superpowers" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn(private_repository_name, text.lower(), path)
+            without_emails = email.sub("", text)
+            self.assertTrue(
+                all(match.group(0).lower().endswith("example.com") for match in hostname.finditer(without_emails)),
+                path,
+            )
+            self.assertTrue(
+                all(set(match.group(0)) == {"0"} for match in cloudflare_id.finditer(text)),
+                path,
+            )
+
+        result = subprocess.run(
+            ["python3", SCANNER, "--path", ROOT],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class SetupCiToolsTest(unittest.TestCase):
