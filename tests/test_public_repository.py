@@ -53,7 +53,9 @@ class PublicRepositoryTest(unittest.TestCase):
                 capture_output=True,
             )
 
-    def run_make_with_fake_terraform(self, *targets: str):
+    def run_make_with_fake_terraform(
+        self, *targets: str, fail_command: str | None = None
+    ):
         with tempfile.TemporaryDirectory() as directory:
             temporary_path = pathlib.Path(directory)
             fake_bin = temporary_path / "bin"
@@ -61,13 +63,15 @@ class PublicRepositoryTest(unittest.TestCase):
             log = temporary_path / "terraform.log"
             terraform = fake_bin / "terraform"
             terraform.write_text(
-                "#!/bin/bash\nset -eu\nprintf '%s\\n' \"$*\" >> \"$FAKE_TERRAFORM_LOG\"\n",
+                "#!/bin/bash\nset -eu\nprintf '%s\\n' \"$*\" >> \"$FAKE_TERRAFORM_LOG\"\n[ \"${FAKE_TERRAFORM_FAIL_COMMAND:-}\" != \"$*\" ] || exit 41\n",
                 encoding="utf-8",
             )
             terraform.chmod(0o700)
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
             environment["FAKE_TERRAFORM_LOG"] = str(log)
+            if fail_command is not None:
+                environment["FAKE_TERRAFORM_FAIL_COMMAND"] = fail_command
 
             result = subprocess.run(
                 ["make", *targets],
@@ -99,6 +103,45 @@ class PublicRepositoryTest(unittest.TestCase):
                 ]
             )
         self.assertEqual(calls, expected_calls)
+
+    def test_native_terraform_target_stops_after_failed_init(self):
+        failed_command = "-chdir=modules/access-applications init -backend=false -input=false"
+        result, calls = self.run_make_with_fake_terraform(
+            "test-terraform", fail_command=failed_command
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [failed_command])
+
+    def test_native_terraform_target_stops_after_failed_suite(self):
+        failed_command = "-chdir=modules/access-applications test"
+        result, calls = self.run_make_with_fake_terraform(
+            "test-terraform", fail_command=failed_command
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            calls,
+            [
+                "-chdir=modules/access-applications init -backend=false -input=false",
+                failed_command,
+            ],
+        )
+
+    def test_validate_target_stops_after_failed_module(self):
+        failed_command = "-chdir=modules/access-applications validate"
+        result, calls = self.run_make_with_fake_terraform(
+            "validate", fail_command=failed_command
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            calls,
+            [
+                "-chdir=modules/access-applications init -backend=false -input=false",
+                failed_command,
+            ],
+        )
 
     def test_check_includes_native_terraform_suites(self):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")

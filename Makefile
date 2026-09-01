@@ -7,7 +7,8 @@ fmt-check:
 	terraform fmt -check -recursive
 
 validate:
-	@for module in modules/* examples/*; do \
+	@set -eu; \
+	for module in modules/* examples/*; do \
 		[ ! -d "$$module" ] || terraform -chdir="$$module" init -backend=false -input=false >/dev/null; \
 		[ ! -d "$$module" ] || terraform -chdir="$$module" validate; \
 	done
@@ -16,7 +17,8 @@ test-unit:
 	python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 test-terraform:
-	@for module in modules/* examples/*; do \
+	@set -eu; \
+	for module in modules/* examples/*; do \
 		[ ! -d "$$module" ] || terraform -chdir="$$module" init -backend=false -input=false >/dev/null; \
 		[ ! -d "$$module" ] || terraform -chdir="$$module" test; \
 	done
