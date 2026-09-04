@@ -1,5 +1,9 @@
 resource "random_bytes" "tunnel_secret" {
   length = 32
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "cloudflare_zero_trust_tunnel_cloudflared" "this" {
@@ -9,6 +13,8 @@ resource "cloudflare_zero_trust_tunnel_cloudflared" "this" {
   tunnel_secret = random_bytes.tunnel_secret.base64
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy      = true
+    ignore_changes       = [tunnel_secret]
+    replace_triggered_by = [random_bytes.tunnel_secret]
   }
 }
