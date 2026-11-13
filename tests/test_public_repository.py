@@ -123,14 +123,14 @@ class PublicRepositoryTest(unittest.TestCase):
         for root in roots:
             expected_calls.extend(
                 [
-                    f"-chdir={root} init -backend=false -input=false",
+                    f"-chdir={root} init -backend=false -input=false -lockfile=readonly",
                     f"-chdir={root} test",
                 ]
             )
         self.assertEqual(calls, expected_calls)
 
     def test_native_terraform_target_stops_after_failed_init(self):
-        failed_command = "-chdir=modules/access-applications init -backend=false -input=false"
+        failed_command = "-chdir=modules/access-applications init -backend=false -input=false -lockfile=readonly"
         result, calls = self.run_make_with_fake_terraform(
             "test-terraform", fail_command=failed_command
         )
@@ -148,7 +148,7 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "-chdir=modules/access-applications init -backend=false -input=false",
+                "-chdir=modules/access-applications init -backend=false -input=false -lockfile=readonly",
                 failed_command,
             ],
         )
@@ -163,7 +163,7 @@ class PublicRepositoryTest(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "-chdir=modules/access-applications init -backend=false -input=false",
+                "-chdir=modules/access-applications init -backend=false -input=false -lockfile=readonly",
                 failed_command,
             ],
         )

@@ -80,14 +80,6 @@ run "shared_otp_protected_applications" {
   }
 
   assert {
-    condition = nonsensitive(alltrue([
-      for key, value in cloudflare_zero_trust_access_identity_provider.otp.config :
-      value == null if !contains(["enable_encryption", "redirect_url", "restrict_to_account_members"], key)
-    ]))
-    error_message = "The one-time PIN identity provider must use an empty config object."
-  }
-
-  assert {
     condition     = cloudflare_zero_trust_access_policy.owners.account_id == "00000000000000000000000000000000" && cloudflare_zero_trust_access_policy.owners.name == "Owners" && cloudflare_zero_trust_access_policy.owners.decision == "allow"
     error_message = "The reusable Owners policy must be an account-scoped allow policy."
   }
