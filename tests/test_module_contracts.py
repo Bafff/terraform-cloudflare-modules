@@ -167,6 +167,18 @@ class ModuleContractTest(unittest.TestCase):
             re.search(r'(?m)^\s*resource\s+"(?:local_file|local_sensitive_file)"', text)
         )
 
+    def test_otp_identity_provider_sets_an_empty_config(self):
+        # A planned config also holds the provider's computed fields, which change
+        # between provider releases, so pin what the module itself sets.
+        text = (MODULES / "access-applications" / "main.tf").read_text(encoding="utf-8")
+        resource = re.search(
+            r'^resource\s+"cloudflare_zero_trust_access_identity_provider"\s+"otp"\s*\{(?P<body>.*?)^\}',
+            text,
+            re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(resource)
+        self.assertRegex(resource.group("body"), r"(?m)^\s*config\s*=\s*\{\s*\}\s*$")
+
     def test_access_email_input_is_sensitive(self):
         text = (MODULES / "access-applications" / "variables.tf").read_text(encoding="utf-8")
         variable = re.search(
